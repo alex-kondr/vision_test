@@ -1,11 +1,15 @@
 """
 Модуль комп'ютерного зору (Vision Matcher) для пошуку динамічних елементів,
 кнопок, виділених документів та пунктів контекстного меню при їх зміщенні.
+
+Стратегія пошуку (гібридна):
+  1. Gemini Vision API  — аналізує знімок екрана та банк шаблонів, повертає координати
+  2. OpenCV matchTemplate — швидкий fallback якщо Gemini недоступний або не знайшов елемент
 """
 import io
 import base64
 import time
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 import numpy as np
 import cv2
 from PIL import Image, ImageGrab
@@ -15,6 +19,14 @@ try:
     HAS_MSS = True
 except ImportError:
     HAS_MSS = False
+
+# Gemini Vision (опціональний)
+try:
+    from gemini_vision import find_element_with_gemini, is_gemini_available
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
+    def is_gemini_available(): return False
 
 
 class VisionMatcher:
@@ -27,7 +39,7 @@ class VisionMatcher:
         # Спроба 1: MSS (найшвидший спосіб захоплення)
         if HAS_MSS:
             try:
-                with mss.MSS() as sct:
+                with mss.mss() as sct:
                     monitor = sct.monitors[0]  # всі монітори або основний
                     sct_img = sct.grab(monitor)
                     # MSS повертає BGRA
@@ -113,63 +125,130 @@ class VisionMatcher:
         offset_y: int,
         confidence: float = 0.75,
         search_vicinity_radius: int = 350,
-        screen_img: Optional[np.ndarray] = None
+        screen_img: Optional[np.ndarray] = None,
+        template_bank: Optional[List[str]] = None,
+        element_hint: str = "",
+        use_gemini: bool = True,
     ) -> Optional[Tuple[int, int, float]]:
         """
         Шукає шаблон на поточному екрані.
-        Спочатку шукає в радіусі очікуваних координат (де міг зміститися рядок або контекстне меню).
-        Якщо не знайдено — шукає по всьому екрану.
+
+        Стратегія (гібридна):
+          1. Gemini Vision API (якщо доступний та увімкнений):
+             - Передає знімок екрана + банк шаблонів до Gemini
+             - Повертає точні координати центру елемента
+          2. OpenCV matchTemplate (fallback):
+             - Спочатку шукає в радіусі очікуваних координат
+             - Якщо не знайдено — шукає по всьому екрану
         
         Повертає (actual_click_x, actual_click_y, confidence_score) або None.
         """
-        template = VisionMatcher.b64_to_image(template_b64)
-        if template is None:
-            return None
-
         if screen_img is None:
             screen_img = VisionMatcher.capture_screen_image()
 
         if screen_img is None:
             return None
 
-        t_h, t_w = template.shape[:2]
-        s_h, s_w = screen_img.shape[:2]
+        # === СТРАТЕГІЯ 1: Gemini Vision ===
+        if use_gemini and HAS_GEMINI and is_gemini_available():
+            bank = template_bank or ([template_b64] if template_b64 else [])
+            if bank:
+                result = find_element_with_gemini(
+                    screen_img=screen_img,
+                    template_bank=bank,
+                    expected_x=expected_x,
+                    expected_y=expected_y,
+                    offset_x=offset_x,
+                    offset_y=offset_y,
+                    element_hint=element_hint,
+                )
+                if result:
+                    return result
 
-        if s_h < t_h or s_w < t_w:
+        # === СТРАТЕГІЯ 2: OpenCV matchTemplate (fallback) ===
+        return VisionMatcher._find_with_opencv(
+            template_b64=template_b64,
+            expected_x=expected_x,
+            expected_y=expected_y,
+            offset_x=offset_x,
+            offset_y=offset_y,
+            confidence=confidence,
+            search_vicinity_radius=search_vicinity_radius,
+            screen_img=screen_img,
+            template_bank=template_bank,
+        )
+
+    @staticmethod
+    def _find_with_opencv(
+        template_b64: str,
+        expected_x: int,
+        expected_y: int,
+        offset_x: int,
+        offset_y: int,
+        confidence: float = 0.75,
+        search_vicinity_radius: int = 350,
+        screen_img: Optional[np.ndarray] = None,
+        template_bank: Optional[List[str]] = None,
+    ) -> Optional[Tuple[int, int, float]]:
+        """
+        OpenCV matchTemplate пошук.
+        При наявності template_bank — пробує кожен шаблон з банку (кращий виграє).
+        """
+        if screen_img is None:
             return None
 
-        # Конвертуємо у відтінки сірого для стійкості до підсвітки/hover
+        # Збираємо усі шаблони для перевірки (банк + основний)
+        candidates = list(template_bank) if template_bank else []
+        if template_b64 and template_b64 not in candidates:
+            candidates.insert(0, template_b64)
+
+        if not candidates:
+            return None
+
+        s_h, s_w = screen_img.shape[:2]
         screen_gray = cv2.cvtColor(screen_img, cv2.COLOR_BGR2GRAY)
-        template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
 
-        # ЕТАП 1: Пошук в області очікуваного зміщення (швидкий та точний для рядків і контекстних меню)
-        if search_vicinity_radius > 0:
-            vx1 = max(0, expected_x - search_vicinity_radius)
-            vy1 = max(0, expected_y - search_vicinity_radius)
-            vx2 = min(s_w, expected_x + search_vicinity_radius)
-            vy2 = min(s_h, expected_y + search_vicinity_radius)
+        best_result = None
+        best_score = 0.0
 
-            if (vx2 - vx1) >= t_w and (vy2 - vy1) >= t_h:
-                vicinity_crop = screen_gray[vy1:vy2, vx1:vx2]
-                res_vicinity = cv2.matchTemplate(vicinity_crop, template_gray, cv2.TM_CCOEFF_NORMED)
-                min_v, max_v, min_l, max_l = cv2.minMaxLoc(res_vicinity)
+        for tmpl_b64 in candidates:
+            template = VisionMatcher.b64_to_image(tmpl_b64)
+            if template is None:
+                continue
 
-                if max_v >= confidence:
-                    found_x = vx1 + max_l[0]
-                    found_y = vy1 + max_l[1]
-                    click_x = found_x + offset_x
-                    click_y = found_y + offset_y
-                    return click_x, click_y, float(max_v)
+            t_h, t_w = template.shape[:2]
+            if s_h < t_h or s_w < t_w:
+                continue
 
-        # ЕТАП 2: Якщо зміщення значне або елемент перемістився в іншу частину вікна — глобальний пошук
-        res_global = cv2.matchTemplate(screen_gray, template_gray, cv2.TM_CCOEFF_NORMED)
-        min_v, max_v, min_l, max_l = cv2.minMaxLoc(res_global)
+            template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
 
-        if max_v >= confidence:
-            found_x = max_l[0]
-            found_y = max_l[1]
-            click_x = found_x + offset_x
-            click_y = found_y + offset_y
-            return click_x, click_y, float(max_v)
+            # ЕТАП 1: Пошук в зоні очікуваних координат (швидкий)
+            if search_vicinity_radius > 0:
+                vx1 = max(0, expected_x - search_vicinity_radius)
+                vy1 = max(0, expected_y - search_vicinity_radius)
+                vx2 = min(s_w, expected_x + search_vicinity_radius)
+                vy2 = min(s_h, expected_y + search_vicinity_radius)
+
+                if (vx2 - vx1) >= t_w and (vy2 - vy1) >= t_h:
+                    vicinity_crop = screen_gray[vy1:vy2, vx1:vx2]
+                    res = cv2.matchTemplate(vicinity_crop, template_gray, cv2.TM_CCOEFF_NORMED)
+                    _, max_v, _, max_l = cv2.minMaxLoc(res)
+
+                    if max_v > best_score:
+                        best_score = max_v
+                        found_x = vx1 + max_l[0]
+                        found_y = vy1 + max_l[1]
+                        best_result = (found_x + offset_x, found_y + offset_y, max_v)
+
+            # ЕТАП 2: Глобальний пошук по всьому екрану
+            res_global = cv2.matchTemplate(screen_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+            _, max_v, _, max_l = cv2.minMaxLoc(res_global)
+
+            if max_v > best_score:
+                best_score = max_v
+                best_result = (max_l[0] + offset_x, max_l[1] + offset_y, max_v)
+
+        if best_result and best_score >= confidence:
+            return best_result
 
         return None

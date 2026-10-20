@@ -6,7 +6,7 @@
 """
 import time
 import threading
-from typing import List, Callable, Optional, Tuple
+from typing import List, Callable, Optional, Tuple, Any
 from pynput import mouse, keyboard
 from models import WorkflowAction, Workflow
 from vision_matcher import VisionMatcher
@@ -33,6 +33,47 @@ class ActionRecorder:
         self.on_pause_toggled: Optional[Callable[[bool], None]] = None
         
         self._press_state = {}
+        
+        # Існуючий сценарій для об'єднання банку шаблонів (при повторному навчанні)
+        self._existing_workflow: Optional[Any] = None
+
+    def set_existing_workflow(self, workflow: Any):
+        """Встановлює існуючий сценарій для об'єднання банку шаблонів при повторному навчанні."""
+        self._existing_workflow = workflow
+
+    def merge_template_banks(self, new_actions: List[WorkflowAction]) -> List[WorkflowAction]:
+        """
+        Об'єднує банки шаблонів з попереднього запису (існуючого сценарію) з новими знімками.
+        
+        Алгоритм зіставлення:
+        - Співставляємо нові дії з існуючими за позицією в списку (по-порядку виконання)
+        - Якщо дія знайдена і має шаблон — додаємо новий знімок до існуючого банку
+        - На вихід повертаємо існуючі дії з оновленими банками шаблонів
+        """
+        if not self._existing_workflow or not self._existing_workflow.actions:
+            return new_actions
+        
+        existing = self._existing_workflow.actions
+        result = []
+        
+        # Проходимо через існуючі дії і знаходимо відповідні нові за типом
+        new_click_actions = [a for a in new_actions if a.type in ("click", "double_click", "right_click") and a.template_b64]
+        new_idx = 0
+        
+        for old_action in existing:
+            merged = WorkflowAction.from_dict(old_action.to_dict())  # глибока копія
+            
+            if old_action.type in ("click", "double_click", "right_click") and old_action.template_b64:
+                # Шукаємо відповідну нову дію за типом і порядком
+                if new_idx < len(new_click_actions):
+                    new_action = new_click_actions[new_idx]
+                    new_idx += 1
+                    if new_action.template_b64:
+                        merged.add_to_bank(new_action.template_b64)
+            
+            result.append(merged)
+        
+        return result
 
     def set_ignored_region(self, x1: int, y1: int, x2: int, y2: int):
         self.ignored_rect = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))

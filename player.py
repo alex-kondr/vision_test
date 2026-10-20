@@ -12,6 +12,11 @@ from vision_matcher import VisionMatcher
 import winsound
 import pyperclip
 
+try:
+    from gemini_vision import is_gemini_available
+except ImportError:
+    def is_gemini_available(): return False
+
 # Безпечна екстрена зупинка
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.02
@@ -182,8 +187,10 @@ class ActionPlayer:
     def _resolve_click_coordinates(self, action: WorkflowAction) -> Tuple[int, int]:
         """
         Визначає реальні координати кліку:
-        Якщо увімкнено Smart Vision і збережено шаблон — шукає зміщений елемент на екрані.
-        Якщо ні або якщо елемент не знайдено — використовує базові координати (action.x, action.y).
+        1. Якщо увімкнено Smart Vision та збережено шаблон:
+           a. Gemini Vision API (якщо доступний) — аналізує весь банк шаблонів
+           b. OpenCV matchTemplate — fallback
+        2. Якщо нічого не знайдено — використовує базові координати (action.x, action.y).
         """
         target_x = action.x or 0
         target_y = action.y or 0
@@ -196,12 +203,24 @@ class ActionPlayer:
         )
 
         if use_vision:
-            # Спроба пошуку зі знімком
             confidence = getattr(action, "confidence", 0.75) or 0.75
             offset_x = action.template_offset_x or (action.template_width // 2 if action.template_width else 0)
             offset_y = action.template_offset_y or (action.template_height // 2 if action.template_height else 0)
 
-            # Робимо до 2 спроб із невеликою затримкою (на випадок появи контекстного меню чи анімації)
+            # Банк шаблонів з усіх попередніх сеансів навчання
+            bank = getattr(action, "template_bank", []) or []
+
+            # Текстова підказка для Gemini Vision (коментар кроку)
+            hint = getattr(action, "comment", "") or ""
+
+            # Повідомляємо про режим пошуку
+            gemini_on = is_gemini_available()
+            if self.on_vision_status:
+                bank_info = f" [банк: {len(bank)} знімків]" if bank else ""
+                mode_str = "Gemini Vision + OpenCV" if gemini_on else "OpenCV"
+                self.on_vision_status(f"🔍 {mode_str} пошук{bank_info}...")
+
+            # Робимо до 2 спроб із невеликою затримкою
             found = None
             for attempt in range(2):
                 if self.abort_requested:
@@ -213,22 +232,29 @@ class ActionPlayer:
                     offset_x=offset_x,
                     offset_y=offset_y,
                     confidence=confidence,
-                    search_vicinity_radius=400
+                    search_vicinity_radius=400,
+                    template_bank=bank,
+                    element_hint=hint,
+                    use_gemini=gemini_on,
                 )
                 if found:
                     break
-                time.sleep(0.12)
+                time.sleep(0.15)
 
             if found:
                 actual_x, actual_y, score = found
                 if actual_x != target_x or actual_y != target_y:
-                    msg = f"🎯 Зір виявив зміщення: ({target_x}, {target_y}) ➔ ({actual_x}, {actual_y}) [Точність: {int(score*100)}%]"
+                    mode = "🤖 Gemini" if gemini_on else "🎯 OpenCV"
+                    msg = f"{mode} виявив зміщення: ({target_x}, {target_y}) ➔ ({actual_x}, {actual_y}) [Точність: {int(score*100)}%]"
                     if self.on_vision_status:
                         self.on_vision_status(msg)
+                else:
+                    if self.on_vision_status:
+                        self.on_vision_status(f"✅ Елемент знайдено на ({actual_x}, {actual_y}) [Точність: {int(score*100)}%]")
                 return actual_x, actual_y
             else:
                 if self.on_vision_status:
-                    self.on_vision_status(f"⚠️ Елемент не виявлено зором, використовуються базові ({target_x}, {target_y})")
+                    self.on_vision_status(f"⚠️ Елемент не знайдено, використовуються базові ({target_x}, {target_y})")
 
         return target_x, target_y
 

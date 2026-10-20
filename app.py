@@ -1,7 +1,8 @@
 """
 Головний модуль графічного інтерфейсу (AutoFlow Assistant).
-Дозволяє записувати дії (з точками підтвердження та комп'ютерним зором Smart Vision),
+Дозволяє записувати дії (з точками підтвердження та Smart Vision),
 редагувати їх, зберігати/завантажувати та виконувати багаторазові цикли.
+Підтримує багаторазове навчання: кожен запис додає нові знімки до банку Gemini Vision.
 """
 import os
 import sys
@@ -16,6 +17,12 @@ from player import ActionPlayer
 from floating_bar import FloatingRecordingBar
 from dialogs import CheckpointModalDialog, EditActionDialog
 
+try:
+    from gemini_vision import set_api_key, is_gemini_available
+except ImportError:
+    def set_api_key(k): os.environ["GEMINI_API_KEY"] = k
+    def is_gemini_available(): return False
+
 # Налаштування теми CustomTkinter
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -26,8 +33,8 @@ class AutoFlowApp(ctk.CTk):
         super().__init__()
 
         self.title("AutoFlow Assistant — Автоматизація пошти та документів")
-        self.geometry("1020x700")
-        self.minsize(880, 600)
+        self.geometry("1020x760")
+        self.minsize(880, 650)
 
         # Об'єкти моделі, запису та відтворення
         self.workflow = Workflow(
@@ -36,6 +43,9 @@ class AutoFlowApp(ctk.CTk):
         )
         self.recorder = ActionRecorder(enable_smart_vision=True)
         self.player = ActionPlayer()
+        
+        # Лічильник навчань: кількість записів для поточного сценарію
+        self._training_runs: int = 0
 
         self.floating_bar: Optional[FloatingRecordingBar] = None
 
@@ -44,6 +54,9 @@ class AutoFlowApp(ctk.CTk):
 
         # Побудова графічного інтерфейсу
         self._build_ui()
+
+        # Завантажуємо Gemini API ключ з .env / змінного середовища (якщо є)
+        self._load_gemini_api_key()
 
         # Спробуємо завантажити шаблон за замовчуванням, якщо існує
         self._load_default_template_if_exists()
@@ -73,7 +86,7 @@ class AutoFlowApp(ctk.CTk):
 
         lbl_app_name = ctk.CTkLabel(
             title_box,
-            text="⚡ AutoFlow Assistant  [Smart Vision]",
+            text="⚡ AutoFlow Assistant  [Gemini Vision + Smart Vision]",
             font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
             text_color="#38bdf8"
         )
@@ -81,7 +94,7 @@ class AutoFlowApp(ctk.CTk):
 
         lbl_subtitle = ctk.CTkLabel(
             title_box,
-            text="Навчання діям зі знімками динамічних кнопок/меню та точками очікування підтвердження",
+            text="Багаторазове навчання: кожен новий запис додає знімки Gemini Vision для кращого розпізнавання",
             font=ctk.CTkFont(family="Segoe UI", size=12),
             text_color="#94a3b8"
         )
@@ -104,7 +117,7 @@ class AutoFlowApp(ctk.CTk):
         controls_frame = ctk.CTkFrame(self, corner_radius=10)
         controls_frame.pack(fill="x", padx=15, pady=5)
 
-        # Кнопка ЗАПИСАТИ
+        # Кнопка ЗАПИСАТИ (перший запис / повне перезаписування)
         self.btn_record = ctk.CTkButton(
             controls_frame,
             text="⏺ Навчити (Запис дій)",
@@ -116,7 +129,34 @@ class AutoFlowApp(ctk.CTk):
             corner_radius=8,
             command=self.start_recording
         )
-        self.btn_record.pack(side="left", padx=(15, 8), pady=10)
+        self.btn_record.pack(side="left", padx=(15, 4), pady=10)
+
+        # Кнопка ДОДАТИ ЗАПИС НАВЧАННЯ (об'єднання банку шаблонів)
+        self.btn_add_training = ctk.CTkButton(
+            controls_frame,
+            text="🧠 +Навчання",
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            fg_color="#7c3aed",
+            hover_color="#6d28d9",
+            height=40,
+            width=130,
+            corner_radius=8,
+            command=self.add_training_run
+        )
+        self.btn_add_training.pack(side="left", padx=4, pady=10)
+
+        # Лічильник навчань 
+        self.lbl_training_runs = ctk.CTkLabel(
+            controls_frame,
+            text="📚 0 навч.",
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            text_color="#a78bfa",
+            width=60
+        )
+        self.lbl_training_runs.pack(side="left", padx=(0, 8))
+
+        sep0 = ctk.CTkFrame(controls_frame, width=2, height=36, fg_color="#334155")
+        sep0.pack(side="left", padx=8, pady=10)
 
         # Кнопка ВІДТВОРИТИ
         self.btn_play = ctk.CTkButton(
@@ -189,14 +229,14 @@ class AutoFlowApp(ctk.CTk):
         # Чекбокс Smart Vision
         self.chk_smart_vision = ctk.CTkCheckBox(
             controls_frame,
-            text="🎯 Smart Vision (пошук за зміщенням)",
+            text="🎯 Smart Vision",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color="#38bdf8",
             onvalue=True,
             offvalue=False
         )
         self.chk_smart_vision.select()
-        self.chk_smart_vision.pack(side="right", padx=15)
+        self.chk_smart_vision.pack(side="right", padx=8)
 
         # Опція паузи на початку кожного циклу
         self.chk_pause_cycle = ctk.CTkCheckBox(
@@ -208,6 +248,56 @@ class AutoFlowApp(ctk.CTk):
         )
         self.chk_pause_cycle.select()
         self.chk_pause_cycle.pack(side="right", padx=10)
+
+        # 2b. Панель Gemini Vision API Key
+        gemini_frame = ctk.CTkFrame(self, corner_radius=8, fg_color=("#1e1b4b", "#0a0a1a"))
+        gemini_frame.pack(fill="x", padx=15, pady=(0, 4))
+
+        lbl_gemini = ctk.CTkLabel(
+            gemini_frame,
+            text="🤖 Gemini Vision API:",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            text_color="#a78bfa"
+        )
+        lbl_gemini.pack(side="left", padx=(12, 8), pady=6)
+
+        self.entry_api_key = ctk.CTkEntry(
+            gemini_frame,
+            placeholder_text="AIza... (Google AI Studio API Key)",
+            width=350,
+            height=28,
+            font=ctk.CTkFont(size=12),
+            show="*"
+        )
+        self.entry_api_key.pack(side="left", padx=(0, 8), pady=6)
+
+        self.btn_save_key = ctk.CTkButton(
+            gemini_frame,
+            text="✔ Застосувати",
+            font=ctk.CTkFont(size=11),
+            fg_color="#4f46e5",
+            hover_color="#4338ca",
+            height=28,
+            width=100,
+            command=self._apply_gemini_api_key
+        )
+        self.btn_save_key.pack(side="left", padx=4, pady=6)
+
+        self.lbl_gemini_status = ctk.CTkLabel(
+            gemini_frame,
+            text="❌ Не налаштовано",
+            font=ctk.CTkFont(size=11),
+            text_color="#f87171"
+        )
+        self.lbl_gemini_status.pack(side="left", padx=8, pady=6)
+
+        lbl_gemini_hint = ctk.CTkLabel(
+            gemini_frame,
+            text="ℹ️ Ключ отримайте на aistudio.google.com",
+            font=ctk.CTkFont(size=10),
+            text_color="#64748b"
+        )
+        lbl_gemini_hint.pack(side="right", padx=12)
 
         # 3. Центральна частина — Таблиця дій сценарію
         center_frame = ctk.CTkFrame(self, corner_radius=10)
@@ -287,7 +377,7 @@ class AutoFlowApp(ctk.CTk):
         self.tree.heading("num", text="№")
         self.tree.heading("type", text="Тип дії")
         self.tree.heading("description", text="Деталі / Повідомлення")
-        self.tree.heading("vision", text="Smart Vision")
+        self.tree.heading("vision", text="Vision (знімки)")
         self.tree.heading("delay", text="Затримка")
 
         self.tree.column("num", width=40, anchor="center")
@@ -417,9 +507,10 @@ class AutoFlowApp(ctk.CTk):
                 desc = f"Базові: ({action.x}, {action.y})"
                 if action.comment:
                     desc += f"  [{action.comment}]"
-
                 if action.template_b64 and getattr(action, "use_vision", True):
-                    vision_badge = f"🎯 Знімок {action.template_width}x{action.template_height}"
+                    bank = getattr(action, "template_bank", [])
+                    bank_count = len(bank) if bank else 1
+                    vision_badge = f"🤖🎯 {action.template_width}x{action.template_height} [x{bank_count}]"
                 elif action.template_b64:
                     vision_badge = "Вимкнено"
                 else:
@@ -443,8 +534,163 @@ class AutoFlowApp(ctk.CTk):
         total = len(self.workflow.actions)
         checkpoints_count = sum(1 for a in self.workflow.actions if a.type == "checkpoint")
         vision_count = sum(1 for a in self.workflow.actions if a.template_b64)
+        max_bank = max((len(getattr(a, "template_bank", []) or []) for a in self.workflow.actions if a.template_b64), default=0)
+        gemini_str = f" | 🤖 Gemini: налаштовано" if is_gemini_available() else " | 🤖 Gemini: не налаштовано"
+        bank_str = f" | 📚 Банк: до {max_bank} знімків" if max_bank > 1 else ""
         self.lbl_actions_count.configure(
-            text=f"📋 Кроки: {total} дій ({checkpoints_count} точок схвалення, {vision_count} Smart Vision якорів)"
+            text=f"📋 Кроки: {total} ({checkpoints_count} точок схвалення, {vision_count} Vision){bank_str}{gemini_str}"
+        )
+
+    # ==========================================================
+    # GEMINI API KEY
+    # ==========================================================
+    def _load_gemini_api_key(self):
+        """Завантажує Gemini API ключ з змінних середовища або файлу .env."""
+        key = os.environ.get("GEMINI_API_KEY", "")
+        if not key:
+            # Спроба завантажити з .env файлу поруч з програмою
+            env_path = os.path.join(os.path.dirname(__file__), ".env")
+            if os.path.exists(env_path):
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("GEMINI_API_KEY="):
+                            key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            break
+        if key:
+            self.entry_api_key.insert(0, key)
+            set_api_key(key)
+            self._update_gemini_status()
+
+    def _apply_gemini_api_key(self):
+        """Застосовує введений API ключ до Gemini Vision."""
+        key = self.entry_api_key.get().strip()
+        if not key:
+            messagebox.showwarning("Gemini API", "Будь ласка, введіть API ключ.", parent=self)
+            return
+        set_api_key(key)
+        # Зберігаємо до .env для наступного запуску
+        env_path = os.path.join(os.path.dirname(__file__), ".env")
+        try:
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.write(f'GEMINI_API_KEY="{key}"\n')
+        except Exception:
+            pass
+        self._update_gemini_status()
+
+    def _update_gemini_status(self):
+        """Оновлює індикатор статусу Gemini Vision."""
+        if is_gemini_available():
+            self.lbl_gemini_status.configure(
+                text="✅ Gemini Vision активний",
+                text_color="#4ade80"
+            )
+        else:
+            self.lbl_gemini_status.configure(
+                text="❌ Не налаштовано",
+                text_color="#f87171"
+            )
+        self._refresh_table()
+
+    # ==========================================================
+    # БАГАТОРАЗОВЕ НАВЧАННЯ (Multi-Run Training)
+    # ==========================================================
+    def add_training_run(self):
+        """
+        Запускає додатковий запис навчання для існуючого сценарію.
+        Після запису нові знімки елементів об'єднуються з банком поточного сценарію.
+        Чим більше запусків — тим краще Gemini розпізнає елементи при різних умовах.
+        """
+        if self.recorder.is_recording:
+            return
+
+        if not self.workflow.actions:
+            messagebox.showwarning(
+                "Додати навчання",
+                "Спочатку запишіть базовий сценарій (кнопка '⏺ Навчити').",
+                parent=self
+            )
+            return
+
+        runs = self._training_runs
+        reply = messagebox.askyesno(
+            "Додати запис навчання",
+            f"Поточний сценарій має {runs} додаткових записів навчання.\n\n"
+            f"🧠 Новий запис буде ДОДАНИЙ до банку шаблонів — Gemini Vision\n"
+            f"отримає більше прикладів і краще розпізнаватиме елементи.\n\n"
+            f"Виконайте ті ж дії, що й при першому записі.\n"
+            f"Готові розпочати?",
+            parent=self
+        )
+        if not reply:
+            return
+
+        # Позначаємо режим злиття
+        self.recorder.set_existing_workflow(self.workflow)
+        self.recorder.enable_smart_vision = self.chk_smart_vision.get()
+
+        self.lbl_status_badge.configure(
+            text=f"🔴 ЗАПИС НАВЧ. #{runs + 1}",
+            fg_color="#6b21a8",
+            text_color="#e9d5ff"
+        )
+        self.lbl_progress_text.configure(
+            text=f"🧠 Додатковий запис навчання #{runs + 1}. Виконайте ті ж дії. F10 — завершити."
+        )
+
+        self.floating_bar = FloatingRecordingBar(
+            self,
+            on_add_checkpoint=self._add_checkpoint_from_floating_bar,
+            on_toggle_pause=self.recorder.toggle_pause,
+            on_stop_recording=self._stop_training_run,
+            on_position_changed=self._on_floating_bar_moved
+        )
+
+        self.iconify()
+        self.recorder.start_recording()
+
+    def _stop_training_run(self):
+        """Зупиняє додатковий запис навчання та об'єднує банки шаблонів."""
+        if not self.recorder.is_recording:
+            return
+
+        new_actions = self.recorder.stop_recording()
+
+        if self.floating_bar:
+            try:
+                self.floating_bar.destroy()
+            except Exception:
+                pass
+            self.floating_bar = None
+
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+        # Об'єднуємо банки шаблонів
+        merged = self.recorder.merge_template_banks(new_actions)
+        self.workflow.actions = merged
+        self.recorder.set_existing_workflow(None)
+
+        self._training_runs += 1
+        self.lbl_training_runs.configure(
+            text=f"📚 {self._training_runs} навч."
+        )
+
+        self.lbl_status_badge.configure(
+            text="🟢 Навчання оновлено",
+            fg_color="#1e3a8a",
+            text_color="#93c5fd"
+        )
+        self._refresh_table()
+
+        v_count = sum(1 for a in new_actions if a.template_b64)
+        messagebox.showinfo(
+            "Навчання додано!",
+            f"✅ Запис навчання #{self._training_runs} успішно додано до банку шаблонів!\n\n"
+            f"• Нових знімків елементів: {v_count}\n"
+            f"• Загалом записів навчання: {self._training_runs}\n\n"
+            f"Gemini Vision тепер має більше прикладів для точнішого розпізнавання!",
+            parent=self
         )
 
     # ==========================================================

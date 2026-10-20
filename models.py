@@ -1,6 +1,7 @@
 """
 Моделі даних для збереження та завантаження сценаріїв автоматизації
-з підтримкою візуальних якорів (Smart Vision Templates).
+з підтримкою візуальних якорів (Smart Vision Templates) та банку шаблонів
+для багаторазового навчання (кожен новий запис додає нові знімки елементів).
 """
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Any, Optional
@@ -18,13 +19,17 @@ class WorkflowAction:
     button: Optional[str] = "left"  # 'left', 'right', 'middle'
     
     # Комп'ютерний зір (Smart Vision для зміщених кнопок/меню/рядків)
-    template_b64: Optional[str] = None      # Знімок елемента в base64 PNG
+    template_b64: Optional[str] = None      # Знімок елемента в base64 PNG (перший / останній запис)
     template_offset_x: Optional[int] = None # Зміщення кліку від лівого краю шаблону
     template_offset_y: Optional[int] = None # Зміщення кліку від верхнього краю шаблону
     template_width: Optional[int] = None
     template_height: Optional[int] = None
     use_vision: bool = True                 # Чи використовувати візуальний пошук
     confidence: float = 0.75               # Поріг точності розпізнавання (0.0 - 1.0)
+    
+    # Банк шаблонів — знімки з КОЖНОГО запуску навчання (для кращого розпізнавання Gemini Vision)
+    # Кожен елемент списку — base64 PNG з окремого сеансу навчання
+    template_bank: List[str] = field(default_factory=list)
     
     # Для клавіатури
     key: Optional[str] = None  # назва клавіші, наприклад 'enter', 'tab', 'ctrl', тощо.
@@ -39,7 +44,11 @@ class WorkflowAction:
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         # Видаляємо None поля для компактності JSON
-        return {k: v for k, v in d.items() if v is not None}
+        # template_bank зберігаємо навіть якщо порожній (щоб from_dict завжди міг відновити)
+        result = {k: v for k, v in d.items() if v is not None}
+        if "template_bank" not in result:
+            result["template_bank"] = []
+        return result
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'WorkflowAction':
@@ -48,10 +57,19 @@ class WorkflowAction:
         filtered = {k: v for k, v in data.items() if k in valid_fields}
         return cls(**filtered)
 
+    def add_to_bank(self, new_template_b64: str):
+        """Додає новий знімок елемента до банку шаблонів (при повторному навчанні)."""
+        if new_template_b64 and new_template_b64 not in self.template_bank:
+            self.template_bank.append(new_template_b64)
+            # Оновлюємо основний шаблон до найновішого знімку
+            self.template_b64 = new_template_b64
+
     def get_display_text(self) -> str:
         """Повертає зрозумілий користувачу опис кроку для відображення в списку дій."""
         delay_str = f"[{self.delay_before:.2f}с]" if self.delay_before > 0 else ""
-        vision_str = " 🎯[Зір]" if self.template_b64 and self.use_vision else ""
+        bank_count = len(self.template_bank)
+        vision_str = f" 🎯[Зір×{bank_count}]" if self.template_b64 and self.use_vision and bank_count > 1 else (
+            " 🎯[Зір]" if self.template_b64 and self.use_vision else "")
         
         if self.type == "checkpoint":
             return f"🛑 ТОЧКА СХВАЛЕННЯ: \"{self.title}\" — {self.message}"
