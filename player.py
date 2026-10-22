@@ -394,6 +394,12 @@ class ActionPlayer:
             # Визначаємо актуальні координати (зі Smart Vision або базові)
             click_x, click_y = self._resolve_click_coordinates(action)
 
+            # Захист від нульових координат — запобігаємо PyAutoGUI fail-safe (кут 0,0)
+            if click_x <= 5 and click_y <= 5:
+                if self.on_vision_status:
+                    self.on_vision_status(f"⚠️ Пропуск кліку: координати ({click_x}, {click_y}) занадто близько до кута екрана (fail-safe захист)")
+                return
+
             if action.type in ("click", "menu_click"):
                 btn = action.button if action.button in ("left", "right", "middle") else "left"
                 pyautogui.click(x=click_x, y=click_y, button=btn)

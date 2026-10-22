@@ -10,6 +10,7 @@ import customtkinter as ctk
 from typing import Callable, Optional, Tuple
 from models import WorkflowAction
 from region_selector import ScreenRegionSelector
+from pynput import keyboard as pynput_keyboard
 
 try:
     from gemini_vision import extract_element_text_from_crop, is_gemini_available
@@ -86,7 +87,7 @@ class CheckpointModalDialog(ctk.CTkToplevel):
 
         lbl_hint = ctk.CTkLabel(
             frame,
-            text="💡 Натисніть Enter або кнопку нижче для продовження. Esc — зупинити все.",
+            text="💡 Натисніть F8 або кнопку нижче для продовження. Esc — зупинити все.",
             font=ctk.CTkFont(family="Segoe UI", size=11),
             text_color="#64748b"
         )
@@ -123,7 +124,7 @@ class CheckpointModalDialog(ctk.CTkToplevel):
 
         self.btn_continue = ctk.CTkButton(
             btn_frame,
-            text="✅ Продовжити (Enter)",
+            text="✅ Продовжити (F8)",
             font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
             fg_color="#10b981",
             hover_color="#059669",
@@ -134,15 +135,43 @@ class CheckpointModalDialog(ctk.CTkToplevel):
         )
         self.btn_continue.pack(side="right", fill="x", expand=True)
 
-        self.bind("<Return>", lambda e: self._respond("continue"))
         self.bind("<space>", lambda e: self._respond("continue"))
         self.bind("<Escape>", lambda e: self._respond("abort"))
         self.protocol("WM_DELETE_WINDOW", lambda: self._respond("abort"))
+
+        # F8 — глобальний перехоп через pynput (так само, як працює запис сценарію)
+        self._kb_listener = None
+        self._start_f8_listener()
+
+    def _start_f8_listener(self):
+        """Запускає pynput listener для F8 — глобальне перехоплення клавіши незалежно від фокусу."""
+        def on_press(key):
+            if not self.responded:
+                try:
+                    if key == pynput_keyboard.Key.f8:
+                        self.after(0, lambda: self._respond("continue"))
+                        return False  # зупиняємо listener
+                except Exception:
+                    pass
+
+        self._kb_listener = pynput_keyboard.Listener(on_press=on_press)
+        self._kb_listener.daemon = True
+        self._kb_listener.start()
+
+    def _bind_f7_recursive(self, widget):
+        """Unused — залишено для сумісності."""
+        pass
 
     def _respond(self, result: str):
         if self.responded:
             return
         self.responded = True
+        # Зупиняємо pynput listener
+        try:
+            if self._kb_listener and self._kb_listener.is_alive():
+                self._kb_listener.stop()
+        except Exception:
+            pass
         try:
             self.grab_release()
             self.destroy()
