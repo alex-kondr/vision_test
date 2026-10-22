@@ -36,6 +36,10 @@ class ActionPlayer:
         self._checkpoint_event = threading.Event()
         self._checkpoint_result = "continue"
         
+        # Подія для вибору файлу з контекстного меню
+        self._file_menu_event = threading.Event()
+        self._selected_file_result: Optional[dict] = None
+        
         # Гаряча клавіша екстреної зупинки (Esc)
         self._esc_listener: Optional[pynput.keyboard.Listener] = None
         
@@ -44,6 +48,7 @@ class ActionPlayer:
         self.on_cycle_end: Optional[Callable[[int, int], None]] = None
         self.on_step_change: Optional[Callable[[int, int, WorkflowAction], None]] = None
         self.on_checkpoint: Optional[Callable[[WorkflowAction, int, int], None]] = None
+        self.on_file_menu_request: Optional[Callable[[List[dict], WorkflowAction], None]] = None
         self.on_finished: Optional[Callable[[bool, str], None]] = None
         self.on_vision_status: Optional[Callable[[str], None]] = None
         
@@ -75,6 +80,7 @@ class ActionPlayer:
         self.is_running = False
         self._checkpoint_result = "abort"
         self._checkpoint_event.set()
+        self._file_menu_event.set()
         self._stop_esc_listener()
 
     def resume_from_checkpoint(self, action_result: str = "continue"):
@@ -82,6 +88,12 @@ class ActionPlayer:
         if action_result == "abort":
             self.abort_requested = True
         self._checkpoint_event.set()
+
+    def resume_from_file_menu(self, file_dict: Optional[dict]):
+        """Отримує обраний файл із контекстного меню та продовжує роботу."""
+        self._selected_file_result = file_dict
+        self._file_menu_event.set()
+
 
     def _start_esc_listener(self):
         def on_press(key):
@@ -187,19 +199,28 @@ class ActionPlayer:
     def _resolve_click_coordinates(self, action: WorkflowAction) -> Tuple[int, int]:
         """
         Визначає реальні координати кліку:
-        1. Якщо увімкнено Smart Vision та збережено шаблон:
-           a. Gemini Vision API (якщо доступний) — аналізує весь банк шаблонів
-           b. OpenCV matchTemplate — fallback
-        2. Якщо нічого не знайдено — використовує базові координати (action.x, action.y).
+        1. Для кліку по області (area_click): використовує координати зони фокусування.
+        2. Для конкретного елемента / кнопки / пункту меню:
+           a. Gemini Vision API (якщо доступний) — аналізує весь банк шаблонів, семантичний текст
+              ('Додаткові дії') та знаходить елемент навіть при зміщенні на 10-25%.
+           b. OpenCV matchTemplate — fallback у радіусі 500px або по всьому екрану.
+        3. Якщо нічого не знайдено — використовує базові координати (action.x, action.y).
         """
         target_x = action.x or 0
         target_y = action.y or 0
+
+        # Клік по області — не потребує піксельного шаблону, клікає для фокусу списку/панелі
+        if action.type == "area_click" or getattr(action, "target_type", "") == "area":
+            return target_x, target_y
+
+        elem_text = getattr(action, "element_text", "") or ""
+        target_type = getattr(action, "target_type", "element") or "element"
 
         # Перевірка чи використовується комп'ютерний зір
         use_vision = (
             getattr(self.workflow, "use_smart_vision", True)
             and getattr(action, "use_vision", True)
-            and bool(action.template_b64)
+            and (bool(action.template_b64) or bool(elem_text))
         )
 
         if use_vision:
@@ -217,8 +238,9 @@ class ActionPlayer:
             gemini_on = is_gemini_available()
             if self.on_vision_status:
                 bank_info = f" [банк: {len(bank)} знімків]" if bank else ""
-                mode_str = "Gemini Vision + OpenCV" if gemini_on else "OpenCV"
-                self.on_vision_status(f"🔍 {mode_str} пошук{bank_info}...")
+                name_info = f" \"{elem_text}\"" if elem_text else ""
+                mode_str = "Gemini Vision" if gemini_on else "OpenCV"
+                self.on_vision_status(f"🔍 {mode_str}: пошук елемента{name_info}{bank_info}...")
 
             # Робимо до 2 спроб із невеликою затримкою
             found = None
@@ -226,15 +248,17 @@ class ActionPlayer:
                 if self.abort_requested:
                     break
                 found = VisionMatcher.find_element_on_screen(
-                    template_b64=action.template_b64,
+                    template_b64=action.template_b64 or "",
                     expected_x=target_x,
                     expected_y=target_y,
                     offset_x=offset_x,
                     offset_y=offset_y,
                     confidence=confidence,
-                    search_vicinity_radius=400,
+                    search_vicinity_radius=500,
                     template_bank=bank,
                     element_hint=hint,
+                    element_text=elem_text,
+                    target_type=target_type,
                     use_gemini=gemini_on,
                 )
                 if found:
@@ -245,7 +269,8 @@ class ActionPlayer:
                 actual_x, actual_y, score = found
                 if actual_x != target_x or actual_y != target_y:
                     mode = "🤖 Gemini" if gemini_on else "🎯 OpenCV"
-                    msg = f"{mode} виявив зміщення: ({target_x}, {target_y}) ➔ ({actual_x}, {actual_y}) [Точність: {int(score*100)}%]"
+                    label = f" \"{elem_text}\"" if elem_text else ""
+                    msg = f"{mode} знайшов{label} зі зміщенням: ({target_x}, {target_y}) ➔ ({actual_x}, {actual_y}) [Точність: {int(score*100)}%]"
                     if self.on_vision_status:
                         self.on_vision_status(msg)
                 else:
@@ -272,24 +297,117 @@ class ActionPlayer:
         if self.abort_requested:
             return
 
-        if action.type in ("click", "double_click", "right_click"):
+        # 1. Прокрутка списку виключно вниз (по осі X не рухаємо) – спрощена реалізація
+        if action.type == "scroll_to_bottom" or getattr(action, "scroll_to_bottom", False):
+            if self.on_vision_status:
+                self.on_vision_status("📜 Вертикальна прокрутка списку вниз (вісь X зафіксована)...")
+            # Прокручування коліщатком вниз
+            for _ in range(10):
+                if self.abort_requested:
+                    break
+                pyautogui.scroll(-500)
+                time.sleep(0.02)
+            # Додаткові натискання PageDown для гарантованого переходу до кінця
+            try:
+                for _ in range(2):
+                    pyautogui.press("pagedown")
+                    time.sleep(0.05)
+            except Exception:
+                pass
+            time.sleep(0.15)
+            return
+
+        # 2. Вибір файлу зі списку на екрані (з відображенням контекстного меню або авто)
+        if action.type == "file_selection" or getattr(action, "show_file_menu", False):
+            rect1 = getattr(action, "area_rect_1", None)
+            rect2 = getattr(action, "area_rect_2", None)
+            priority = getattr(action, "search_priority", "area_1_first")
+            
+            area_desc = ""
+            if rect1 and rect2:
+                pr_text = "Область 1 ➔ 2" if priority == "area_1_first" else ("Область 2 ➔ 1" if priority == "area_2_first" else "Область 1 + 2")
+                area_desc = f" (за 2 областями, {pr_text})"
+            elif rect1:
+                area_desc = f" (в Області 1: {rect1})"
+
+            if self.on_vision_status:
+                self.on_vision_status(f"🔍 Сканування екрана: пошук списку файлів{area_desc}...")
+
+            # Шукаємо файли на екрані за двома областями з урахуванням пріоритету
+            files = VisionMatcher.detect_files_with_priority(
+                area_rect_1=rect1,
+                area_rect_2=rect2,
+                priority=priority
+            )
+
+            if getattr(action, "show_file_menu", False) and self.on_file_menu_request:
+                self._file_menu_event.clear()
+                self._selected_file_result = None
+                self.on_file_menu_request(files, action)
+                self._file_menu_event.wait()
+                
+                if self.abort_requested:
+                    return
+
+                chosen = self._selected_file_result
+                if chosen and "x" in chosen and "y" in chosen:
+                    cx = chosen["x"]
+                    cy = chosen["y"]
+                    fname = chosen.get("name", "файл")
+                    if self.on_vision_status:
+                        self.on_vision_status(f"📄 Вибрано файл: {fname} на ({cx}, {cy})")
+                    pyautogui.click(x=cx, y=cy)
+                    time.sleep(0.15)
+            else:
+                # Автоматичний вибір: клікаємо на останній файл у списку (найнижчий)
+                if files:
+                    bottom_file = max(files, key=lambda f: f.get("y", 0))
+                    cx = bottom_file["x"]
+                    cy = bottom_file["y"]
+                    fname = bottom_file.get("name", "файл")
+                    if self.on_vision_status:
+                        self.on_vision_status(f"📄 Авто-вибір останнього файлу: {fname} на ({cx}, {cy})")
+                    pyautogui.click(x=cx, y=cy)
+                elif action.x and action.y:
+                    pyautogui.click(x=action.x, y=action.y)
+                time.sleep(0.15)
+            return
+
+        # 3. Кліки (по області, кнопці, подвійний або контекстне меню)
+        if action.type in ("click", "double_click", "right_click", "area_click", "menu_click"):
+            # Клік по області (фокусування вікна списку)
+            if action.type == "area_click" or getattr(action, "target_type", "") == "area":
+                rect1 = getattr(action, "area_rect_1", None)
+                if rect1:
+                    click_x = (rect1[0] + rect1[2]) // 2
+                    click_y = (rect1[1] + rect1[3]) // 2
+                else:
+                    click_x = action.x or 500
+                    click_y = action.y or 500
+                if self.on_vision_status:
+                    self.on_vision_status(f"🔲 Клік по області списку на ({click_x}, {click_y})")
+                pyautogui.click(x=click_x, y=click_y, button="left")
+                time.sleep(0.15)
+                return
+
+
             # Визначаємо актуальні координати (зі Smart Vision або базові)
             click_x, click_y = self._resolve_click_coordinates(action)
 
-            if action.type == "click":
+            if action.type in ("click", "menu_click"):
                 btn = action.button if action.button in ("left", "right", "middle") else "left"
                 pyautogui.click(x=click_x, y=click_y, button=btn)
             elif action.type == "double_click":
                 pyautogui.doubleClick(x=click_x, y=click_y)
             elif action.type == "right_click":
                 pyautogui.rightClick(x=click_x, y=click_y)
-                # Коротка пауза після відкриття контекстного меню для його промальовування
                 time.sleep(0.1)
 
         elif action.type == "key_press":
             self._type_key(action.key)
         elif action.type == "delay":
             pass
+
 
     def _type_key(self, key_str: Optional[str]):
         if not key_str:

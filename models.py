@@ -4,19 +4,37 @@
 для багаторазового навчання (кожен новий запис додає нові знімки елементів).
 """
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import json
 import time
 
 @dataclass
 class WorkflowAction:
-    type: str  # 'click', 'double_click', 'right_click', 'key_down', 'key_up', 'key_press', 'checkpoint', 'delay'
+    type: str  # 'click', 'double_click', 'right_click', 'area_click', 'menu_click', 'scroll_to_bottom', 'file_selection', 'key_press', 'checkpoint', 'delay'
     delay_before: float = 0.2  # Затримка перед виконанням дії (в секундах)
+    
+    # Розмежування типів цілей: 'element' (кнопка/елемент), 'area' (область списку), 'menu_item' (пункт меню), 'file_item' (файл)
+    target_type: str = "element"
+    element_text: Optional[str] = ""        # Назва/текст елемента (наприклад, 'Додаткові дії') для семантичного розпізнавання
     
     # Для миші (базові координати)
     x: Optional[int] = None
     y: Optional[int] = None
     button: Optional[str] = "left"  # 'left', 'right', 'middle'
+    
+    # Прокрутка списку
+    scroll_amount: Optional[int] = None     # Кількість кроків прокрутки (від'ємне = вниз)
+    scroll_to_bottom: bool = False          # Чи прокручувати список до самого низу
+    
+    # Вибір файлів та контекстне меню
+    show_file_menu: bool = False            # Відображати контекстне меню зі списком знайдених файлів
+    detected_files: List[Dict[str, Any]] = field(default_factory=list)  # Список знайдених файлів на екрані
+    
+    # Області пошуку (дві області з пріоритетом для виявлення файлів/документів або області кліку)
+    area_rect_1: Optional[Tuple[int, int, int, int]] = None  # (x1, y1, x2, y2)
+    area_rect_2: Optional[Tuple[int, int, int, int]] = None  # (x1, y1, x2, y2)
+    search_priority: str = "area_1_first"  # 'area_1_first' (Область 1 -> 2), 'area_2_first' (Область 2 -> 1), 'both'
+
     
     # Комп'ютерний зір (Smart Vision для зміщених кнопок/меню/рядків)
     template_b64: Optional[str] = None      # Знімок елемента в base64 PNG (перший / останній запис)
@@ -28,7 +46,6 @@ class WorkflowAction:
     confidence: float = 0.75               # Поріг точності розпізнавання (0.0 - 1.0)
     
     # Банк шаблонів — знімки з КОЖНОГО запуску навчання (для кращого розпізнавання Gemini Vision)
-    # Кожен елемент списку — base64 PNG з окремого сеансу навчання
     template_bank: List[str] = field(default_factory=list)
     
     # Для клавіатури
@@ -43,25 +60,27 @@ class WorkflowAction:
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
-        # Видаляємо None поля для компактності JSON
-        # template_bank зберігаємо навіть якщо порожній (щоб from_dict завжди міг відновити)
         result = {k: v for k, v in d.items() if v is not None}
         if "template_bank" not in result:
             result["template_bank"] = []
+        if "detected_files" not in result:
+            result["detected_files"] = []
         return result
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'WorkflowAction':
-        # Забезпечуємо сумісність зі старими файлами
         valid_fields = cls.__dataclass_fields__.keys()
         filtered = {k: v for k, v in data.items() if k in valid_fields}
+        if "area_rect_1" in filtered and filtered["area_rect_1"] is not None:
+            filtered["area_rect_1"] = tuple(filtered["area_rect_1"])
+        if "area_rect_2" in filtered and filtered["area_rect_2"] is not None:
+            filtered["area_rect_2"] = tuple(filtered["area_rect_2"])
         return cls(**filtered)
 
     def add_to_bank(self, new_template_b64: str):
         """Додає новий знімок елемента до банку шаблонів (при повторному навчанні)."""
         if new_template_b64 and new_template_b64 not in self.template_bank:
             self.template_bank.append(new_template_b64)
-            # Оновлюємо основний шаблон до найновішого знімку
             self.template_b64 = new_template_b64
 
     def get_display_text(self) -> str:
@@ -70,16 +89,35 @@ class WorkflowAction:
         bank_count = len(self.template_bank)
         vision_str = f" 🎯[Зір×{bank_count}]" if self.template_b64 and self.use_vision and bank_count > 1 else (
             " 🎯[Зір]" if self.template_b64 and self.use_vision else "")
+        text_info = f" \"{self.element_text}\"" if self.element_text else ""
         
         if self.type == "checkpoint":
             return f"🛑 ТОЧКА СХВАЛЕННЯ: \"{self.title}\" — {self.message}"
+        elif self.type == "area_click" or self.target_type == "area":
+            rect_info = f" [Область: {self.area_rect_1}]" if self.area_rect_1 else ""
+            return f"🔲 Клік по області на ({self.x}, {self.y}){rect_info} {delay_str}"
+        elif self.type == "scroll_to_bottom" or self.scroll_to_bottom:
+            return f"📜 Прокрутка списку до самого низу {delay_str}"
+        elif self.type == "file_selection" or self.show_file_menu:
+            menu_info = " [З меню вибору]" if self.show_file_menu else ""
+            if self.area_rect_1 and self.area_rect_2:
+                pr = "1 ➔ 2" if self.search_priority == "area_1_first" else ("2 ➔ 1" if self.search_priority == "area_2_first" else "1+2")
+                area_info = f" [2 зони пошуку, пріоритет: {pr}]"
+            elif self.area_rect_1:
+                area_info = f" [Зона 1: {self.area_rect_1}]"
+            else:
+                area_info = ""
+            return f"📁 Пошук та вибір файлу{text_info}{area_info}{menu_info} {delay_str}"
+        elif self.type == "menu_click" or self.target_type == "menu_item":
+
+            return f"📋 Пункт меню{text_info} на ({self.x}, {self.y}){vision_str} {delay_str}"
         elif self.type == "click":
             btn_name = "Лівий клік" if self.button == "left" else ("Правий клік" if self.button == "right" else "Клік коліщатком")
-            return f"🖱️ {btn_name} на ({self.x}, {self.y}){vision_str} {delay_str}"
+            return f"🔘 {btn_name}{text_info} на ({self.x}, {self.y}){vision_str} {delay_str}"
         elif self.type == "double_click":
-            return f"🖱️🖱️ Подвійний клік на ({self.x}, {self.y}){vision_str} {delay_str}"
+            return f"🖱️🖱️ Подвійний клік{text_info} на ({self.x}, {self.y}){vision_str} {delay_str}"
         elif self.type == "right_click":
-            return f"🖱️ Контекстне меню (правий клік) на ({self.x}, {self.y}){vision_str} {delay_str}"
+            return f"🖱️ Контекстне меню (правий клік){text_info} на ({self.x}, {self.y}){vision_str} {delay_str}"
         elif self.type == "key_press":
             return f"⌨️ Клавіша: '{self.key}' {delay_str}"
         elif self.type == "delay":
@@ -128,3 +166,36 @@ class Workflow:
     def load_from_file(cls, file_path: str) -> 'Workflow':
         with open(file_path, "r", encoding="utf-8") as f:
             return cls.from_json(f.read())
+
+    def add_start_sequence(self, area_x: int, area_y: int, show_file_menu: bool = True):
+        """
+        Додає обов'язковий початковий блок дій:
+        1. Клік по області списку (фокусування контейнера/таблиці)
+        2. Прокрутка списку до самого низу
+        3. Вибір файлу внизу списку (з виводом контекстного меню або авто)
+        """
+        seq = [
+            WorkflowAction(
+                type="area_click",
+                target_type="area",
+                x=area_x,
+                y=area_y,
+                delay_before=0.4,
+                comment="Клік по області списку (фокусування)"
+            ),
+            WorkflowAction(
+                type="scroll_to_bottom",
+                scroll_to_bottom=True,
+                delay_before=0.5,
+                comment="Прокрутка списку до самого низу"
+            ),
+            WorkflowAction(
+                type="file_selection",
+                target_type="file_item",
+                show_file_menu=show_file_menu,
+                delay_before=0.8,
+                comment="Вибір файлу внизу списку (контекстне меню знайдених файлів)"
+            )
+        ]
+        self.actions = seq + self.actions
+

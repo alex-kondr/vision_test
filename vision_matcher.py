@@ -22,11 +22,13 @@ except ImportError:
 
 # Gemini Vision (опціональний)
 try:
-    from gemini_vision import find_element_with_gemini, is_gemini_available
+    from gemini_vision import find_element_with_gemini, is_gemini_available, detect_files_on_screen
     HAS_GEMINI = True
 except ImportError:
     HAS_GEMINI = False
     def is_gemini_available(): return False
+    def detect_files_on_screen(*args, **kwargs): return []
+
 
 
 class VisionMatcher:
@@ -124,22 +126,24 @@ class VisionMatcher:
         offset_x: int,
         offset_y: int,
         confidence: float = 0.75,
-        search_vicinity_radius: int = 350,
+        search_vicinity_radius: int = 500,
         screen_img: Optional[np.ndarray] = None,
         template_bank: Optional[List[str]] = None,
         element_hint: str = "",
+        element_text: str = "",
+        target_type: str = "element",
         use_gemini: bool = True,
     ) -> Optional[Tuple[int, int, float]]:
         """
-        Шукає шаблон на поточному екрані.
+        Шукає шаблон або семантичний елемент (наприклад, пункт меню 'Додаткові дії') на поточному екрані.
 
         Стратегія (гібридна):
           1. Gemini Vision API (якщо доступний та увімкнений):
-             - Передає знімок екрана + банк шаблонів до Gemini
-             - Повертає точні координати центру елемента
+             - Шукає за семантичною назвою, типом цілі та зразками зображення
+             - Розуміє зміщення меню або елемента на 10-25%
           2. OpenCV matchTemplate (fallback):
-             - Спочатку шукає в радіусі очікуваних координат
-             - Якщо не знайдено — шукає по всьому екрану
+             - Шукає в розширеному радіусі очікуваних координат (500px)
+             - Якщо не знайдено — глобальний пошук по всьому екрану
         
         Повертає (actual_click_x, actual_click_y, confidence_score) або None.
         """
@@ -152,7 +156,7 @@ class VisionMatcher:
         # === СТРАТЕГІЯ 1: Gemini Vision ===
         if use_gemini and HAS_GEMINI and is_gemini_available():
             bank = template_bank or ([template_b64] if template_b64 else [])
-            if bank:
+            if bank or element_text:
                 result = find_element_with_gemini(
                     screen_img=screen_img,
                     template_bank=bank,
@@ -161,6 +165,8 @@ class VisionMatcher:
                     offset_x=offset_x,
                     offset_y=offset_y,
                     element_hint=element_hint,
+                    element_text=element_text,
+                    target_type=target_type,
                 )
                 if result:
                     return result
@@ -177,6 +183,129 @@ class VisionMatcher:
             screen_img=screen_img,
             template_bank=template_bank,
         )
+
+    @staticmethod
+    def detect_files_in_area(
+        screen_img: Optional[np.ndarray] = None,
+        area_rect: Optional[Tuple[int, int, int, int]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Знаходить файли на екрані за допомогою Gemini Vision або евристичного детектора.
+        Повертає список: [{'name': '001_Документ.pdf', 'x': 450, 'y': 720}, ...]
+        """
+        if screen_img is None:
+            screen_img = VisionMatcher.capture_screen_image()
+
+        if screen_img is None:
+            return []
+
+        # 1. Спроба через Gemini Vision
+        if HAS_GEMINI and is_gemini_available():
+            files = detect_files_on_screen(screen_img, search_rect=area_rect)
+            if files:
+                return files
+
+        # 2. Евристичний детектор рядків у списку (fallback без Gemini)
+        return VisionMatcher._detect_rows_heuristic(screen_img, area_rect)
+
+    @staticmethod
+    def detect_files_with_priority(
+        screen_img: Optional[np.ndarray] = None,
+        area_rect_1: Optional[Tuple[int, int, int, int]] = None,
+        area_rect_2: Optional[Tuple[int, int, int, int]] = None,
+        priority: str = "area_1_first"
+    ) -> List[Dict[str, Any]]:
+        """
+        Шукає файли за двома областями з урахуванням зазначеного пріоритету:
+        - 'area_1_first': Спочатку Область 1; якщо не знайдено — Область 2.
+        - 'area_2_first': Спочатку Область 2; якщо не знайдено — Область 1.
+        - 'both': Об'єднує файли з обох областей.
+        """
+        if screen_img is None:
+            screen_img = VisionMatcher.capture_screen_image()
+        if screen_img is None:
+            return []
+
+        # Якщо є тільки одна з областей
+        if area_rect_1 and not area_rect_2:
+            return VisionMatcher.detect_files_in_area(screen_img, area_rect_1)
+        if area_rect_2 and not area_rect_1:
+            return VisionMatcher.detect_files_in_area(screen_img, area_rect_2)
+        if not area_rect_1 and not area_rect_2:
+            return VisionMatcher.detect_files_in_area(screen_img, None)
+
+        # Обидві області вказані:
+        if priority == "area_2_first":
+            primary_rect, secondary_rect = area_rect_2, area_rect_1
+        else:
+            primary_rect, secondary_rect = area_rect_1, area_rect_2
+
+        if priority == "both":
+            f1 = VisionMatcher.detect_files_in_area(screen_img, area_rect_1)
+            f2 = VisionMatcher.detect_files_in_area(screen_img, area_rect_2)
+            # Об'єднуємо унікальні за координатами
+            seen = set()
+            combined = []
+            for item in f1 + f2:
+                key = (item.get("x", 0) // 10, item.get("y", 0) // 10)
+                if key not in seen:
+                    seen.add(key)
+                    combined.append(item)
+            return combined
+
+        # Спочатку шукаємо в першочерговій області
+        files = VisionMatcher.detect_files_in_area(screen_img, primary_rect)
+        if files:
+            return files
+
+        # Якщо в першій області не знайдено — шукаємо у вторинній
+        return VisionMatcher.detect_files_in_area(screen_img, secondary_rect)
+
+
+    @staticmethod
+    def _detect_rows_heuristic(
+        screen_img: np.ndarray,
+        area_rect: Optional[Tuple[int, int, int, int]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Евристично виявляє рядки файлів/документів у зазначеній області списку.
+        """
+        sh, sw = screen_img.shape[:2]
+        if area_rect:
+            x1, y1, x2, y2 = area_rect
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(sw, x2), min(sh, y2)
+        else:
+            x1, y1, x2, y2 = 50, 100, sw - 50, sh - 100
+
+        crop = screen_img[y1:y2, x1:x2]
+        if crop.size == 0:
+            return []
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        # Горизонтальні лінії/рядки
+        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        row_energy = np.mean(np.abs(sobel_y), axis=1)
+
+        # Знаходимо піки рядків із кроком ~20-35px (типова висота рядка в списках Windows)
+        row_height = 28
+        h_crop = y2 - y1
+        num_rows = max(1, h_crop // row_height)
+        
+        detected = []
+        center_x = x1 + (x2 - x1) // 3  # клік ближче до назви файлу зліва
+        
+        for i in range(min(num_rows, 15)):
+            r_y = y1 + (i * row_height) + (row_height // 2)
+            if r_y < y2 - 5:
+                detected.append({
+                    "name": f"Рядок/Файл #{i + 1} (Y={r_y})",
+                    "x": center_x,
+                    "y": r_y
+                })
+
+        return detected
+
 
     @staticmethod
     def _find_with_opencv(

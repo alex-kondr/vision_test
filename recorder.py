@@ -12,6 +12,14 @@ from models import WorkflowAction, Workflow
 from vision_matcher import VisionMatcher
 import winsound
 
+try:
+    from gemini_vision import extract_element_text_from_crop, is_gemini_available
+    HAS_GEMINI_OCR = True
+except ImportError:
+    HAS_GEMINI_OCR = False
+    def extract_element_text_from_crop(*args, **kwargs): return ""
+    def is_gemini_available(): return False
+
 class ActionRecorder:
     def __init__(self, enable_smart_vision: bool = True):
         self.actions: List[WorkflowAction] = []
@@ -19,6 +27,9 @@ class ActionRecorder:
         self.is_paused = False
         self.enable_smart_vision = enable_smart_vision
         self.last_action_time: float = 0.0
+        
+        # Поточний режим запису кліку: 'element' (кнопка), 'area' (область списку), 'menu_item' (пункт меню)
+        self.current_target_type: str = "element"
         
         self.mouse_listener: Optional[mouse.Listener] = None
         self.keyboard_listener: Optional[keyboard.Listener] = None
@@ -31,11 +42,19 @@ class ActionRecorder:
         self.on_checkpoint_added: Optional[Callable[[WorkflowAction], None]] = None
         self.on_stop_requested: Optional[Callable[[], None]] = None
         self.on_pause_toggled: Optional[Callable[[bool], None]] = None
+        self.on_target_type_changed: Optional[Callable[[str], None]] = None
         
         self._press_state = {}
         
         # Існуючий сценарій для об'єднання банку шаблонів (при повторному навчанні)
         self._existing_workflow: Optional[Any] = None
+
+    def set_target_type(self, target_type: str):
+        """Встановлює тип наступного кліку ('element', 'area', 'menu_item')."""
+        self.current_target_type = target_type
+        if self.on_target_type_changed:
+            self.on_target_type_changed(target_type)
+
 
     def set_existing_workflow(self, workflow: Any):
         """Встановлює існуючий сценарій для об'єднання банку шаблонів при повторному навчанні."""
@@ -168,6 +187,49 @@ class ActionRecorder:
         if self.on_action_recorded:
             self.on_action_recorded(action)
 
+    def add_scroll_to_bottom(self):
+        """Додає дію: прокрутка списку до самого низу."""
+        if not self.is_recording or self.is_paused:
+            return
+        now = time.time()
+        delay = round(max(0.1, now - self.last_action_time), 2) if self.last_action_time else 0.5
+        self.last_action_time = now
+        action = WorkflowAction(
+            type="scroll_to_bottom",
+            delay_before=delay,
+            scroll_to_bottom=True,
+            comment="Прокрутка списку до самого низу"
+        )
+        self.actions.append(action)
+        try:
+            winsound.Beep(750, 120)
+        except Exception:
+            pass
+        if self.on_action_recorded:
+            self.on_action_recorded(action)
+
+    def add_file_selection(self, show_menu: bool = True):
+        """Додає дію: вибір файлу на екрані з відображенням контекстного меню знайдених файлів."""
+        if not self.is_recording or self.is_paused:
+            return
+        now = time.time()
+        delay = round(max(0.1, now - self.last_action_time), 2) if self.last_action_time else 0.5
+        self.last_action_time = now
+        action = WorkflowAction(
+            type="file_selection",
+            target_type="file_item",
+            delay_before=delay,
+            show_file_menu=show_menu,
+            comment="Вибір файлу на екрані (з контекстним меню)"
+        )
+        self.actions.append(action)
+        try:
+            winsound.Beep(900, 120)
+        except Exception:
+            pass
+        if self.on_action_recorded:
+            self.on_action_recorded(action)
+
     def _capture_vision_template(self, x: int, y: int, is_menu: bool = False) -> Optional[dict]:
         if not self.enable_smart_vision or self.is_paused:
             return None
@@ -199,7 +261,33 @@ class ActionRecorder:
             delay = 0.3
             is_right_click = (btn_str == "right")
             
-            crop_data = self._capture_vision_template(x, y, is_menu=is_right_click)
+            # Визначаємо тип цілі кліку (елемент / область / пункт меню)
+            target_type = self.current_target_type
+            is_area_click = (target_type == "area")
+            is_menu_click = (target_type == "menu_item" or is_right_click)
+
+            crop_data = None
+            if not is_area_click:
+                crop_data = self._capture_vision_template(x, y, is_menu=is_menu_click)
+
+            # Автоматичне вилучення тексту кнопки чи пункту меню через Gemini (якщо активний)
+            extracted_text = ""
+            if crop_data and HAS_GEMINI_OCR and is_gemini_available():
+                tmpl_img = VisionMatcher.b64_to_image(crop_data["template_b64"])
+                if tmpl_img is not None:
+                    extracted_text = extract_element_text_from_crop(tmpl_img)
+
+            if is_area_click:
+                action_type = "area_click"
+                comment_text = "Клік по області (фокус списку)"
+                # Скидаємо режим назад до звичайного елемента після одного кліку по області
+                self.set_target_type("element")
+            elif is_menu_click:
+                action_type = "menu_click" if target_type == "menu_item" else ("right_click" if is_right_click else "click")
+                comment_text = f"Пункт меню: {extracted_text}" if extracted_text else "Вибір пункту меню"
+            else:
+                action_type = "click"
+                comment_text = f"Кнопка: {extracted_text}" if extracted_text else "Клік по елементу"
 
             if press_data:
                 px, py, ptime = press_data
@@ -207,9 +295,10 @@ class ActionRecorder:
                     delay = round(max(0.05, ptime - self.last_action_time), 2)
                     self.last_action_time = now
                     
-                    action_type = "right_click" if is_right_click else "click"
                     action = WorkflowAction(
                         type=action_type,
+                        target_type=target_type,
+                        element_text=extracted_text,
                         delay_before=delay,
                         x=x,
                         y=y,
@@ -219,7 +308,8 @@ class ActionRecorder:
                         template_offset_y=crop_data.get("offset_y") if crop_data else None,
                         template_width=crop_data.get("width") if crop_data else None,
                         template_height=crop_data.get("height") if crop_data else None,
-                        use_vision=bool(crop_data)
+                        use_vision=bool(crop_data),
+                        comment=comment_text
                     )
                     self.actions.append(action)
                     if self.on_action_recorded:
@@ -229,7 +319,9 @@ class ActionRecorder:
             delay = round(max(0.05, now - self.last_action_time), 2)
             self.last_action_time = now
             action = WorkflowAction(
-                type="click",
+                type=action_type,
+                target_type=target_type,
+                element_text=extracted_text,
                 delay_before=delay,
                 x=x,
                 y=y,
@@ -239,11 +331,13 @@ class ActionRecorder:
                 template_offset_y=crop_data.get("offset_y") if crop_data else None,
                 template_width=crop_data.get("width") if crop_data else None,
                 template_height=crop_data.get("height") if crop_data else None,
-                use_vision=bool(crop_data)
+                use_vision=bool(crop_data),
+                comment=comment_text
             )
             self.actions.append(action)
             if self.on_action_recorded:
                 self.on_action_recorded(action)
+
 
     def _normalize_key(self, key) -> Tuple[str, bool]:
         if isinstance(key, keyboard.Key):

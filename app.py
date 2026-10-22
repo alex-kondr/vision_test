@@ -15,7 +15,7 @@ from models import Workflow, WorkflowAction
 from recorder import ActionRecorder
 from player import ActionPlayer
 from floating_bar import FloatingRecordingBar
-from dialogs import CheckpointModalDialog, EditActionDialog
+from dialogs import CheckpointModalDialog, EditActionDialog, FileSelectionContextMenu, AddActionDialog
 
 try:
     from gemini_vision import set_api_key, is_gemini_available
@@ -73,8 +73,10 @@ class AutoFlowApp(ctk.CTk):
         self.player.on_cycle_end = self._on_player_cycle_end
         self.player.on_step_change = self._on_player_step_change
         self.player.on_checkpoint = self._on_player_checkpoint
+        self.player.on_file_menu_request = self._on_player_file_menu_request
         self.player.on_finished = self._on_player_finished
         self.player.on_vision_status = self._on_vision_status
+
 
     def _build_ui(self):
         # 1. Верхній заголовок
@@ -388,6 +390,10 @@ class AutoFlowApp(ctk.CTk):
 
         self.tree.tag_configure("checkpoint", background="#451a03", foreground="#fde68a")
         self.tree.tag_configure("click", foreground="#e2e8f0")
+        self.tree.tag_configure("area", foreground="#38bdf8")
+        self.tree.tag_configure("scroll", foreground="#a78bfa")
+        self.tree.tag_configure("file", foreground="#34d399")
+        self.tree.tag_configure("menu", foreground="#fcd34d")
         self.tree.tag_configure("key", foreground="#cbd5e1")
         self.tree.tag_configure("running", background="#1e3a8a", foreground="#ffffff")
 
@@ -403,9 +409,33 @@ class AutoFlowApp(ctk.CTk):
         list_toolbar = ctk.CTkFrame(center_frame, fg_color="transparent")
         list_toolbar.pack(fill="x", padx=15, pady=(4, 8))
 
+        btn_add_action = ctk.CTkButton(
+            list_toolbar,
+            text="➕ Додати дію",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            text_color="#ffffff",
+            height=30,
+            command=self.open_add_action_dialog
+        )
+        btn_add_action.pack(side="left", padx=(0, 6))
+
+        btn_start_seq = ctk.CTkButton(
+            list_toolbar,
+            text="✨ Старт (Область ➔ До низу ➔ Файл)",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#0d9488",
+            hover_color="#0f766e",
+            text_color="#ffffff",
+            height=30,
+            command=self.add_start_sequence_dialog
+        )
+        btn_start_seq.pack(side="left", padx=4)
+
         btn_add_cp = ctk.CTkButton(
             list_toolbar,
-            text="➕ Додати точку схвалення",
+            text="➕ Точка схвалення",
             font=ctk.CTkFont(size=12),
             fg_color="#f59e0b",
             hover_color="#d97706",
@@ -413,7 +443,8 @@ class AutoFlowApp(ctk.CTk):
             height=30,
             command=self.add_manual_checkpoint
         )
-        btn_add_cp.pack(side="left", padx=(0, 6))
+        btn_add_cp.pack(side="left", padx=4)
+
 
         btn_edit = ctk.CTkButton(
             list_toolbar,
@@ -501,9 +532,51 @@ class AutoFlowApp(ctk.CTk):
                 type_str = "🛑 ТОЧКА СХВАЛЕННЯ"
                 desc = f"\"{action.title}\": {action.message}"
                 tag = "checkpoint"
+            elif action.type == "area_click" or getattr(action, "target_type", "") == "area":
+                type_str = "🔲 Клік по області"
+                comment_part = f" [{action.comment}]" if action.comment else ""
+                area_part = f" Обл: {action.area_rect_1}" if getattr(action, "area_rect_1", None) else ""
+                desc = f"Фокус області на ({action.x}, {action.y}){area_part}{comment_part}"
+                vision_badge = "Область"
+                tag = "area"
+            elif action.type == "scroll_to_bottom" or getattr(action, "scroll_to_bottom", False):
+                type_str = "📜 Прокрутка списку"
+                desc = "Прокрутка списку до самого низу (PageDown/End/Коліщатко)"
+                vision_badge = "Навігація"
+                tag = "scroll"
+            elif action.type == "file_selection" or getattr(action, "show_file_menu", False):
+                type_str = "📁 Вибір файлу"
+                mode_str = "Контекстне меню" if getattr(action, "show_file_menu", False) else "Авто-вибір внизу"
+                areas = []
+                if getattr(action, "area_rect_1", None):
+                    areas.append("Обл.1")
+                if getattr(action, "area_rect_2", None):
+                    areas.append("Обл.2")
+                areas_str = f" [{'+'.join(areas)}]" if areas else ""
+                prio_map = {"area_1_first": "Обл.1 спочатку", "area_2_first": "Обл.2 спочатку", "both": "Обидві"}
+                prio = getattr(action, "search_priority", "area_1_first")
+                prio_str = f" [{prio_map.get(prio, prio)}]" if len(areas) > 1 else ""
+                elem_info = f" '{action.element_text}'" if action.element_text else ""
+                desc = f"Пошук файлів на екрані{elem_info} [{mode_str}]{areas_str}{prio_str}"
+                vision_badge = "🤖 Файли"
+                tag = "file"
+            elif action.type == "menu_click" or getattr(action, "target_type", "") == "menu_item":
+                type_str = "📋 Пункт меню"
+                name_str = f" \"{action.element_text}\"" if action.element_text else ""
+                desc = f"Пункт меню{name_str} на ({action.x}, {action.y})"
+                if action.comment:
+                    desc += f"  [{action.comment}]"
+                if action.template_b64 and getattr(action, "use_vision", True):
+                    bank = getattr(action, "template_bank", [])
+                    bank_count = len(bank) if bank else 1
+                    vision_badge = f"🤖 Меню [x{bank_count}]"
+                else:
+                    vision_badge = "Семантика"
+                tag = "menu"
             elif "click" in action.type:
                 is_right = ("right" in action.type or action.button == "right")
-                type_str = "🖱️ Контекстне меню" if is_right else ("🖱️🖱️ Подвійний" if "double" in action.type else "🖱️ Лівий клік")
+                text_part = f" \"{action.element_text}\"" if action.element_text else ""
+                type_str = "🖱️ Контекстне меню" if is_right else ("🖱️🖱️ Подвійний" if "double" in action.type else f"🔘 Клік{text_part}")
                 desc = f"Базові: ({action.x}, {action.y})"
                 if action.comment:
                     desc += f"  [{action.comment}]"
@@ -530,6 +603,7 @@ class AutoFlowApp(ctk.CTk):
                 tag = ""
 
             self.tree.insert("", "end", iid=str(idx - 1), values=(idx, type_str, desc, vision_badge, delay_str), tags=(tag,))
+
 
         total = len(self.workflow.actions)
         checkpoints_count = sum(1 for a in self.workflow.actions if a.type == "checkpoint")
@@ -642,8 +716,12 @@ class AutoFlowApp(ctk.CTk):
             on_add_checkpoint=self._add_checkpoint_from_floating_bar,
             on_toggle_pause=self.recorder.toggle_pause,
             on_stop_recording=self._stop_training_run,
-            on_position_changed=self._on_floating_bar_moved
+            on_position_changed=self._on_floating_bar_moved,
+            on_set_target_type=self.recorder.set_target_type,
+            on_add_scroll=self.recorder.add_scroll_to_bottom,
+            on_add_file_selection=self.recorder.add_file_selection
         )
+
 
         self.iconify()
         self.recorder.start_recording()
@@ -726,8 +804,12 @@ class AutoFlowApp(ctk.CTk):
             on_add_checkpoint=self._add_checkpoint_from_floating_bar,
             on_toggle_pause=self.recorder.toggle_pause,
             on_stop_recording=self.stop_recording,
-            on_position_changed=self._on_floating_bar_moved
+            on_position_changed=self._on_floating_bar_moved,
+            on_set_target_type=self.recorder.set_target_type,
+            on_add_scroll=self.recorder.add_scroll_to_bottom,
+            on_add_file_selection=self.recorder.add_file_selection
         )
+
 
         self.iconify()
         self.recorder.start_recording()
@@ -930,6 +1012,28 @@ class AutoFlowApp(ctk.CTk):
         )
         self.player.resume_from_checkpoint(result)
 
+    def _on_player_file_menu_request(self, files: list, action: WorkflowAction):
+        def show_dialog():
+            self.lbl_status_badge.configure(
+                text="📁 ВИБІР ФАЙЛУ НА ЕКРАНІ",
+                fg_color="#581c87",
+                text_color="#f3e8ff"
+            )
+            FileSelectionContextMenu(
+                self,
+                files=files,
+                on_file_selected=self._on_file_selected_from_menu
+            )
+        self.after(0, show_dialog)
+
+    def _on_file_selected_from_menu(self, chosen_file: Optional[dict]):
+        self.lbl_status_badge.configure(
+            text=f"🔵 Лист {self.player.current_cycle} з {self.player.total_cycles}",
+            fg_color="#0369a1",
+            text_color="#e0f2fe"
+        )
+        self.player.resume_from_file_menu(chosen_file)
+
     def _on_player_finished(self, success: bool, message: str):
         def update():
             self.btn_record.configure(state="normal")
@@ -965,9 +1069,80 @@ class AutoFlowApp(ctk.CTk):
     # ==========================================================
     # РУЧНЕ РЕДАГУВАННЯ СЦЕНАРІЮ
     # ==========================================================
+    def open_add_action_dialog(self):
+        """Відкриває діалог додавання та повного налаштування нової дії."""
+        AddActionDialog(self, on_save=self._on_action_added)
+
+    def _on_action_added(self, new_action: WorkflowAction):
+        selected = self.tree.selection()
+        if selected:
+            idx = int(selected[0]) + 1
+            self.workflow.actions.insert(idx, new_action)
+            new_idx = str(idx)
+        else:
+            self.workflow.actions.append(new_action)
+            new_idx = str(len(self.workflow.actions) - 1)
+        self._refresh_table()
+        self.tree.selection_set(new_idx)
+        self.tree.see(new_idx)
+
+    def add_start_sequence_dialog(self):
+        """Додає початковий ланцюжок дій: Клік по області -> Прокрутка до низу -> Вибір файлу."""
+        default_x = 500
+        default_y = 400
+        for a in self.workflow.actions:
+            if a.x and a.y:
+                default_x = a.x
+                default_y = a.y
+                break
+
+        seq = [
+            WorkflowAction(
+                type="area_click",
+                target_type="area",
+                x=default_x,
+                y=default_y,
+                delay_before=0.5,
+                comment="Клік по області списку (фокусування)"
+            ),
+            WorkflowAction(
+                type="scroll_to_bottom",
+                scroll_to_bottom=True,
+                delay_before=0.5,
+                comment="Прокрутка списку до самого низу"
+            ),
+            WorkflowAction(
+                type="file_selection",
+                target_type="file_item",
+                show_file_menu=True,
+                delay_before=0.8,
+                comment="Вибір файлу внизу списку (контекстне меню знайдених файлів)"
+            )
+        ]
+
+        selected = self.tree.selection()
+        if selected:
+            idx = int(selected[0]) + 1
+            for offset, act in enumerate(seq):
+                self.workflow.actions.insert(idx + offset, act)
+        else:
+            self.workflow.actions = seq + self.workflow.actions
+
+        self._refresh_table()
+        messagebox.showinfo(
+            "Початковий блок створено",
+            "Успішно створено обов'язковий початковий блок дій:\n\n"
+            "1. 🔲 Клік по області списку (фокусування панелі)\n"
+            "2. 📜 Прокрутка списку до самого низу\n"
+            "3. 📁 Вибір файлу зі списку на екрані (контекстне меню)\n\n"
+            "Ви можете відредагувати координати області, двічі клікнувши по 1-му кроку в таблиці.",
+            parent=self
+        )
+
     def add_manual_checkpoint(self):
         action = WorkflowAction(
             type="checkpoint",
+
             delay_before=0.5,
             title="Точка перевірки",
             message="Перевірте стан та натисніть 'Продовжити'"

@@ -15,7 +15,10 @@ class FloatingRecordingBar(ctk.CTkToplevel):
         on_add_checkpoint: Callable[[], None],
         on_toggle_pause: Callable[[], None],
         on_stop_recording: Callable[[], None],
-        on_position_changed: Optional[Callable[[int, int, int, int], None]] = None
+        on_position_changed: Optional[Callable[[int, int, int, int], None]] = None,
+        on_set_target_type: Optional[Callable[[str], None]] = None,
+        on_add_scroll: Optional[Callable[[], None]] = None,
+        on_add_file_selection: Optional[Callable[[], None]] = None
     ):
         super().__init__(master)
         
@@ -23,7 +26,11 @@ class FloatingRecordingBar(ctk.CTkToplevel):
         self.on_toggle_pause = on_toggle_pause
         self.on_stop_recording = on_stop_recording
         self.on_position_changed = on_position_changed
+        self.on_set_target_type = on_set_target_type
+        self.on_add_scroll = on_add_scroll
+        self.on_add_file_selection = on_add_file_selection
         self.is_paused = False
+        self.current_target_mode = "element"  # 'element', 'area'
         
         # Вікно поверх усіх інших
         self.attributes("-topmost", True)
@@ -31,9 +38,9 @@ class FloatingRecordingBar(ctk.CTkToplevel):
         
         # Розмір та позиція
         screen_w = self.winfo_screenwidth()
-        bar_w = 600
+        bar_w = 840
         bar_h = 56
-        pos_x = screen_w - bar_w - 30
+        pos_x = max(10, screen_w - bar_w - 20)
         pos_y = 35
         self.geometry(f"{bar_w}x{bar_h}+{pos_x}+{pos_y}")
         
@@ -60,56 +67,139 @@ class FloatingRecordingBar(ctk.CTkToplevel):
             font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
             text_color="#ef4444"
         )
-        self.lbl_record.pack(side="left", padx=(14, 8), pady=8)
+        self.lbl_record.pack(side="left", padx=(10, 5), pady=8)
         self.lbl_record.bind("<ButtonPress-1>", self._start_drag)
         self.lbl_record.bind("<B1-Motion>", self._on_drag)
+
+        # Перемикач типу кліку: ЕЛЕМЕНТ / ОБЛАСТЬ
+        self.btn_mode_element = ctk.CTkButton(
+            self.container,
+            text="🔘 Кнопка/Елемент",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            width=115,
+            height=32,
+            corner_radius=6,
+            command=lambda: self._set_mode("element")
+        )
+        self.btn_mode_element.pack(side="left", padx=2, pady=8)
+
+        self.btn_mode_area = ctk.CTkButton(
+            self.container,
+            text="🔲 Клік по області",
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            fg_color="#334155",
+            hover_color="#475569",
+            width=115,
+            height=32,
+            corner_radius=6,
+            command=lambda: self._set_mode("area")
+        )
+        self.btn_mode_area.pack(side="left", padx=2, pady=8)
+
+        # Кнопка: ПРОКРУТКА ДО САМОГО НИЗУ
+        self.btn_scroll = ctk.CTkButton(
+            self.container,
+            text="📜 До низу",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            fg_color="#0891b2",
+            hover_color="#0e7490",
+            text_color="#ffffff",
+            width=85,
+            height=32,
+            corner_radius=6,
+            command=self._handle_scroll_click
+        )
+        self.btn_scroll.pack(side="left", padx=2, pady=8)
+
+        # Кнопка: ВИБІР ФАЙЛУ (З МЕНЮ)
+        self.btn_file = ctk.CTkButton(
+            self.container,
+            text="📁 Файл (Меню)",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            fg_color="#7c3aed",
+            hover_color="#6d28d9",
+            text_color="#ffffff",
+            width=95,
+            height=32,
+            corner_radius=6,
+            command=self._handle_file_click
+        )
+        self.btn_file.pack(side="left", padx=2, pady=8)
 
         # 1. Кнопка: ТОЧКА СХВАЛЕННЯ (F8)
         self.btn_checkpoint = ctk.CTkButton(
             self.container,
-            text="⏸ Точка схвалення (F8)",
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            text="⏸ Точка (F8)",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
             fg_color="#f59e0b",
             hover_color="#d97706",
             text_color="#000000",
-            width=160,
-            height=34,
-            corner_radius=8,
+            width=90,
+            height=32,
+            corner_radius=6,
             command=self._handle_checkpoint_click
         )
-        self.btn_checkpoint.pack(side="left", padx=5, pady=8)
+        self.btn_checkpoint.pack(side="left", padx=2, pady=8)
 
         # 2. Кнопка: ПАУЗА / ПРОДОВЖИТИ ЗАПИС (F9)
         self.btn_pause = ctk.CTkButton(
             self.container,
-            text="⏸ Пауза запису (F9)",
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            text="⏸ Пауза (F9)",
+            font=ctk.CTkFont(family="Segoe UI", size=11),
             fg_color="#334155",
             hover_color="#475569",
             text_color="#ffffff",
-            width=150,
-            height=34,
-            corner_radius=8,
+            width=85,
+            height=32,
+            corner_radius=6,
             command=self.on_toggle_pause
         )
-        self.btn_pause.pack(side="left", padx=5, pady=8)
+        self.btn_pause.pack(side="left", padx=2, pady=8)
 
         # 3. Кнопка: ЗАВЕРШИТИ (F10)
         self.btn_stop = ctk.CTkButton(
             self.container,
-            text="⏹ Завершити (F10)",
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            text="⏹ Стоп (F10)",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
             fg_color="#7f1d1d",
             hover_color="#991b1b",
             text_color="#ffffff",
-            width=135,
-            height=34,
-            corner_radius=8,
+            width=85,
+            height=32,
+            corner_radius=6,
             command=self.on_stop_recording
         )
-        self.btn_stop.pack(side="left", padx=(5, 12), pady=8)
+        self.btn_stop.pack(side="left", padx=(2, 8), pady=8)
         
         self.after(100, self._update_bounds)
+
+    def _set_mode(self, mode: str):
+        self.current_target_mode = mode
+        if mode == "area":
+            self.btn_mode_area.configure(fg_color="#d97706", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"))
+            self.btn_mode_element.configure(fg_color="#334155", font=ctk.CTkFont(family="Segoe UI", size=11))
+        else:
+            self.btn_mode_element.configure(fg_color="#2563eb", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"))
+            self.btn_mode_area.configure(fg_color="#334155", font=ctk.CTkFont(family="Segoe UI", size=11))
+        if self.on_set_target_type:
+            self.on_set_target_type(mode)
+
+    def _handle_scroll_click(self):
+        if self.on_add_scroll:
+            self.on_add_scroll()
+            orig = self.btn_scroll.cget("text")
+            self.btn_scroll.configure(text="✅ Додано!")
+            self.after(1000, lambda: self.btn_scroll.configure(text=orig))
+
+    def _handle_file_click(self):
+        if self.on_add_file_selection:
+            self.on_add_file_selection()
+            orig = self.btn_file.cget("text")
+            self.btn_file.configure(text="✅ Додано!")
+            self.after(1000, lambda: self.btn_file.configure(text=orig))
+
 
     def _start_drag(self, event):
         self._drag_start_x = event.x

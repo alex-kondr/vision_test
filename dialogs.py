@@ -2,9 +2,23 @@
 Діалогові вікна: вікно очікування схвалення користувача (Checkpoint Modal)
 та редактор параметрів дій (з підтримкою Smart Vision).
 """
+import base64
+import threading
+import cv2
+import numpy as np
 import customtkinter as ctk
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 from models import WorkflowAction
+from region_selector import ScreenRegionSelector
+
+try:
+    from gemini_vision import extract_element_text_from_crop, is_gemini_available
+    HAS_GEMINI_OCR = True
+except ImportError:
+    HAS_GEMINI_OCR = False
+    def extract_element_text_from_crop(*args, **kwargs): return ""
+    def is_gemini_available(): return False
+
 
 class CheckpointModalDialog(ctk.CTkToplevel):
     def __init__(
@@ -137,125 +151,801 @@ class CheckpointModalDialog(ctk.CTkToplevel):
         self.on_response(result)
 
 
-class EditActionDialog(ctk.CTkToplevel):
-    def __init__(self, master, action: WorkflowAction, on_save: Callable[[WorkflowAction], None]):
+class ActionConfigDialog(ctk.CTkToplevel):
+    """
+    Універсальне модальне вікно для створення нової або редагування існуючої дії.
+    Підтримує інтерактивне виділення мишкою на екрані:
+    - Вибір області (протягування рамки, клік у центр)
+    - Клік по конкретному елементу (виділення кнопки/пункту меню, авторозпізнавання тексту, лівий/правий клік)
+    - Вибір документу (протягування 2 областей пошуку файлів із вибором пріоритету та контекстним меню)
+    - Очікування підтвердження користувача (Checkpoint)
+    - Прокрутка списку до самого низу
+    """
+    def __init__(
+        self,
+        master,
+        action: Optional[WorkflowAction] = None,
+        on_save: Optional[Callable[[WorkflowAction], None]] = None,
+        is_new: bool = False
+    ):
         super().__init__(master)
-        self.action = action
+        self.is_new = is_new
         self.on_save = on_save
         
-        self.title("Редагування кроку")
-        self.geometry("490x440")
-        self.resizable(False, False)
+        # Якщо нова дія — створюємо порожню
+        if action is None:
+            self.action = WorkflowAction(
+                type="area_click",
+                target_type="area",
+                delay_before=0.5,
+                comment="Клік по області списку"
+            )
+        else:
+            self.action = WorkflowAction.from_dict(action.to_dict())  # глибока копія
+
+        # Збережені дані інтерактивного вибору
+        self.area_rect_1 = getattr(self.action, "area_rect_1", None)
+        self.area_rect_2 = getattr(self.action, "area_rect_2", None)
+        self.template_b64 = self.action.template_b64
+        self.template_width = self.action.template_width
+        self.template_height = self.action.template_height
+
+        self.title("Додати дію" if is_new else "Налаштування кроку сценарію")
+        self.geometry("640x720")
+        self.minsize(600, 680)
         self.attributes("-topmost", True)
         self.grab_set()
 
-        frame = ctk.CTkFrame(self, corner_radius=10)
-        frame.pack(fill="both", expand=True, padx=15, pady=15)
+        # Головний контейнер з прокруткою
+        main_container = ctk.CTkFrame(self, corner_radius=12, fg_color=("#1e293b", "#0f172a"))
+        main_container.pack(fill="both", expand=True, padx=14, pady=14)
 
-        lbl_header = ctk.CTkLabel(
-            frame, 
-            text=f"Параметри дії: {action.type.upper()}",
-            font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold")
+        # 1. Заголовок
+        lbl_head = ctk.CTkLabel(
+            main_container,
+            text="➕ Створення нової дії" if is_new else "✏️ Налаштування кроку сценарію",
+            font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"),
+            text_color="#38bdf8"
         )
-        lbl_header.pack(anchor="w", padx=15, pady=(10, 10))
+        lbl_head.pack(anchor="w", padx=16, pady=(12, 6))
 
-        # Затримка
-        lbl_delay = ctk.CTkLabel(frame, text="Затримка перед дією (сек):")
-        lbl_delay.pack(anchor="w", padx=15, pady=(0, 2))
-        self.entry_delay = ctk.CTkEntry(frame)
-        self.entry_delay.pack(fill="x", padx=15, pady=(0, 10))
-        self.entry_delay.insert(0, str(action.delay_before))
+        # 2. Селектор типу дії
+        lbl_sel = ctk.CTkLabel(
+            main_container,
+            text="Оберіть тип операції:",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            text_color="#cbd5e1"
+        )
+        lbl_sel.pack(anchor="w", padx=16, pady=(4, 4))
 
-        # Якщо це точка схвалення:
-        if action.type == "checkpoint":
-            lbl_title = ctk.CTkLabel(frame, text="Назва точки перевірки:")
-            lbl_title.pack(anchor="w", padx=15, pady=(0, 2))
-            self.entry_title = ctk.CTkEntry(frame)
-            self.entry_title.pack(fill="x", padx=15, pady=(0, 10))
-            self.entry_title.insert(0, action.title or "")
+        self.action_types = [
+            "🔲 Вибір області (клік / фокус)",
+            "🔘 Клік по елементу (кнопка / меню)",
+            "📁 Вибір документу (2 області пошуку)",
+            "🛑 Очікування підтвердження",
+            "📜 Прокрутка до самого низу"
+        ]
+        self.combo_type = ctk.CTkComboBox(
+            main_container,
+            values=self.action_types,
+            state="readonly",
+            height=34,
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            command=self._on_type_changed
+        )
+        self.combo_type.pack(fill="x", padx=16, pady=(0, 10))
 
-            lbl_msg = ctk.CTkLabel(frame, text="Текст підказки для оператора:")
-            lbl_msg.pack(anchor="w", padx=15, pady=(0, 2))
-            self.entry_msg = ctk.CTkTextbox(frame, height=80)
-            self.entry_msg.pack(fill="x", padx=15, pady=(0, 10))
-            self.entry_msg.insert("1.0", action.message or "")
-            self.chk_vision = None
-            self.entry_conf = None
-        else:
-            self.entry_title = None
-            self.entry_msg = None
-            
-            if action.x is not None and action.y is not None:
-                lbl_coords = ctk.CTkLabel(
-                    frame, 
-                    text=f"Базові координати: X={action.x}, Y={action.y} (Кнопка: {action.button})"
-                )
-                lbl_coords.pack(anchor="w", padx=15, pady=3)
+        # 3. Динамічний контейнер налаштувань відповідно до обраного типу
+        self.dynamic_frame = ctk.CTkFrame(main_container, fg_color=("#0f172a", "#1e293b"), corner_radius=10)
+        self.dynamic_frame.pack(fill="both", expand=True, padx=16, pady=4)
 
-                # Блок Smart Vision
-                has_template = bool(action.template_b64)
-                vision_status = f"✅ Знімок елемента прив'язано ({action.template_width}x{action.template_height} px)" if has_template else "❌ Знімок відсутній (тільки точні координати)"
-                
-                lbl_v_status = ctk.CTkLabel(
-                    frame,
-                    text=vision_status,
-                    font=ctk.CTkFont(size=12, weight="bold"),
-                    text_color="#10b981" if has_template else "#94a3b8"
-                )
-                lbl_v_status.pack(anchor="w", padx=15, pady=(5, 5))
+        # 4. Нижні спільні параметри: затримка та коментар
+        bottom_frame = ctk.CTkFrame(main_container, fg_color="transparent")
+        bottom_frame.pack(fill="x", padx=16, pady=(10, 4))
 
-                self.chk_vision = ctk.CTkCheckBox(
-                    frame,
-                    text="Використовувати Smart Vision (пошук за зміщенням)",
-                    font=ctk.CTkFont(size=12),
-                    onvalue=True,
-                    offvalue=False
-                )
-                if getattr(action, "use_vision", True) and has_template:
-                    self.chk_vision.select()
-                else:
-                    self.chk_vision.deselect()
-                self.chk_vision.pack(anchor="w", padx=15, pady=5)
+        lbl_delay = ctk.CTkLabel(bottom_frame, text="Затримка перед виконанням (сек):", font=ctk.CTkFont(size=12))
+        lbl_delay.pack(anchor="w", pady=(0, 2))
+        self.entry_delay = ctk.CTkEntry(bottom_frame, height=30)
+        self.entry_delay.pack(fill="x", pady=(0, 6))
+        self.entry_delay.insert(0, str(self.action.delay_before or 0.5))
 
-                lbl_conf = ctk.CTkLabel(frame, text="Поріг точності розпізнавання (0.6 - 0.95):")
-                lbl_conf.pack(anchor="w", padx=15, pady=(5, 2))
-                self.entry_conf = ctk.CTkEntry(frame)
-                self.entry_conf.pack(fill="x", padx=15, pady=(0, 10))
-                self.entry_conf.insert(0, str(getattr(action, "confidence", 0.75) or 0.75))
-            else:
-                self.chk_vision = None
-                self.entry_conf = None
-                if action.key is not None:
-                    lbl_key = ctk.CTkLabel(frame, text=f"Клавіша: '{action.key}'")
-                    lbl_key.pack(anchor="w", padx=15, pady=5)
+        lbl_comment = ctk.CTkLabel(bottom_frame, text="Коментар / примітка кроку:", font=ctk.CTkFont(size=12))
+        lbl_comment.pack(anchor="w", pady=(0, 2))
+        self.entry_comment = ctk.CTkEntry(bottom_frame, height=30, placeholder_text="Опис дії для оператора")
+        self.entry_comment.pack(fill="x", pady=(0, 10))
+        self.entry_comment.insert(0, self.action.comment or "")
+
+        # 5. Кнопки збереження та скасування
+        btn_bar = ctk.CTkFrame(main_container, fg_color="transparent")
+        btn_bar.pack(fill="x", padx=16, pady=(4, 10))
+
+        btn_cancel = ctk.CTkButton(
+            btn_bar,
+            text="Скасувати",
+            font=ctk.CTkFont(family="Segoe UI", size=13),
+            fg_color="#475569",
+            hover_color="#64748b",
+            height=36,
+            width=120,
+            command=self.destroy
+        )
+        btn_cancel.pack(side="left")
 
         btn_save = ctk.CTkButton(
-            frame,
-            text="Зберегти зміни",
-            font=ctk.CTkFont(weight="bold"),
-            fg_color="#3b82f6",
+            btn_bar,
+            text="💾 Зберегти дію",
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            fg_color="#10b981",
+            hover_color="#059669",
+            text_color="#ffffff",
+            height=36,
             command=self._save
         )
-        btn_save.pack(fill="x", padx=15, pady=15)
+        btn_save.pack(side="right", fill="x", expand=True, padx=(10, 0))
 
+        # Визначаємо початковий тип дії
+        self._init_current_type()
+
+    def _init_current_type(self):
+        if self.action.type == "area_click" or self.action.target_type == "area":
+            self.combo_type.set(self.action_types[0])
+        elif self.action.type in ("click", "double_click", "right_click", "menu_click") and self.action.target_type in ("element", "menu_item", "button"):
+            self.combo_type.set(self.action_types[1])
+        elif self.action.type == "file_selection" or self.action.target_type == "file_item" or self.action.show_file_menu:
+            self.combo_type.set(self.action_types[2])
+        elif self.action.type == "checkpoint":
+            self.combo_type.set(self.action_types[3])
+        elif self.action.type == "scroll_to_bottom" or self.action.scroll_to_bottom:
+            self.combo_type.set(self.action_types[4])
+        else:
+            self.combo_type.set(self.action_types[0])
+        self._render_dynamic_fields()
+
+    def _on_type_changed(self, choice):
+        self._render_dynamic_fields()
+
+    def _clear_dynamic_frame(self):
+        for widget in self.dynamic_frame.winfo_children():
+            widget.destroy()
+
+    def _render_dynamic_fields(self):
+        self._clear_dynamic_frame()
+        choice = self.combo_type.get()
+
+        # ============================================================
+        # 1. ВИБІР ОБЛАСТІ
+        # ============================================================
+        if "Вибір області" in choice:
+            lbl_info = ctk.CTkLabel(
+                self.dynamic_frame,
+                text="🔲 Клік по області використовується для активації та фокусування списку або вікна.\n"
+                     "Вміст списку змінюється, тому жорсткий шаблон кнопки тут не потрібен.",
+                font=ctk.CTkFont(size=12),
+                text_color="#94a3b8",
+                justify="left"
+            )
+            lbl_info.pack(anchor="w", padx=14, pady=(12, 10))
+
+            btn_snip_area = ctk.CTkButton(
+                self.dynamic_frame,
+                text="🎯 Вказати область мишкою на екрані",
+                font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+                fg_color="#0284c7",
+                hover_color="#0369a1",
+                height=36,
+                command=self._snip_for_area
+            )
+            btn_snip_area.pack(fill="x", padx=14, pady=6)
+
+            cur_rect = self.area_rect_1 or (
+                (self.action.x - 50, self.action.y - 30, self.action.x + 50, self.action.y + 30)
+                if self.action.x and self.action.y else None
+            )
+            rect_txt = f"✅ Область: ({cur_rect[0]}, {cur_rect[1]}) ➔ ({cur_rect[2]}, {cur_rect[3]})\n" \
+                       f"Точка кліку (центр): ({ (cur_rect[0]+cur_rect[2])//2 }, { (cur_rect[1]+cur_rect[3])//2 })" if cur_rect else "⚠️ Область ще не вказана (натисніть кнопку вище)"
+            
+            self.lbl_area_coords = ctk.CTkLabel(
+                self.dynamic_frame,
+                text=rect_txt,
+                font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                text_color="#38bdf8" if cur_rect else "#f59e0b",
+                justify="left"
+            )
+            self.lbl_area_coords.pack(anchor="w", padx=14, pady=(6, 12))
+
+        # ============================================================
+        # 2. КЛІК ПО ЕЛЕМЕНТУ
+        # ============================================================
+        elif "Клік по елементу" in choice:
+            lbl_info = ctk.CTkLabel(
+                self.dynamic_frame,
+                text="🔘 Точний клік по кнопці або пункту меню зі Smart Vision (Gemini + OpenCV).\n"
+                     "Знаходить елемент навіть при його зміщенні на екрані на 10-25%.",
+                font=ctk.CTkFont(size=12),
+                text_color="#94a3b8",
+                justify="left"
+            )
+            lbl_info.pack(anchor="w", padx=14, pady=(10, 6))
+
+            btn_snip_elem = ctk.CTkButton(
+                self.dynamic_frame,
+                text="🎯 Виділити елемент мишкою на екрані",
+                font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+                fg_color="#7c3aed",
+                hover_color="#6d28d9",
+                height=36,
+                command=self._snip_for_element
+            )
+            btn_snip_elem.pack(fill="x", padx=14, pady=4)
+
+            # Статус знімка
+            has_tmpl = bool(self.template_b64)
+            tmpl_txt = f"✅ Знімок елемента захоплено ({self.template_width}x{self.template_height} px)" if has_tmpl else "❌ Знімок не прив'язано"
+            self.lbl_elem_status = ctk.CTkLabel(
+                self.dynamic_frame,
+                text=tmpl_txt,
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color="#10b981" if has_tmpl else "#f87171"
+            )
+            self.lbl_elem_status.pack(anchor="w", padx=14, pady=(2, 6))
+
+            # Тип кліку: Лівий / Правий / Подвійний
+            lbl_btn_type = ctk.CTkLabel(self.dynamic_frame, text="Тип натискання миші:", font=ctk.CTkFont(size=12))
+            lbl_btn_type.pack(anchor="w", padx=14, pady=(2, 2))
+            
+            self.combo_btn = ctk.CTkComboBox(
+                self.dynamic_frame,
+                values=["Лівий клік (кнопка)", "Правий клік (контекстне меню)", "Подвійний клік"],
+                state="readonly",
+                height=30
+            )
+            if self.action.type == "right_click" or self.action.button == "right":
+                self.combo_btn.set("Правий клік (контекстне меню)")
+            elif self.action.type == "double_click":
+                self.combo_btn.set("Подвійний клік")
+            else:
+                self.combo_btn.set("Лівий клік (кнопка)")
+            self.combo_btn.pack(fill="x", padx=14, pady=(0, 6))
+
+            # Текст елемента
+            lbl_elem_text = ctk.CTkLabel(
+                self.dynamic_frame,
+                text="Назва / семантичний текст (наприклад: 'Додаткові дії' або 'Зберегти'):",
+                font=ctk.CTkFont(size=12)
+            )
+            lbl_elem_text.pack(anchor="w", padx=14, pady=(4, 2))
+            self.entry_element_text = ctk.CTkEntry(
+                self.dynamic_frame,
+                height=30,
+                placeholder_text="Додаткові дії, Друк, Сформувати..."
+            )
+            self.entry_element_text.pack(fill="x", padx=14, pady=(0, 6))
+            self.entry_element_text.insert(0, self.action.element_text or "")
+
+            # Чекбокс Smart Vision
+            self.chk_use_vision = ctk.CTkCheckBox(
+                self.dynamic_frame,
+                text="Використовувати Smart Vision (шукати при зміщенні 10-25%)",
+                font=ctk.CTkFont(size=12),
+                onvalue=True,
+                offvalue=False
+            )
+            if getattr(self.action, "use_vision", True):
+                self.chk_use_vision.select()
+            self.chk_use_vision.pack(anchor="w", padx=14, pady=4)
+
+        # ============================================================
+        # 3. ВИБІР ДОКУМЕНТУ (2 ОБЛАСТІ ПОШУКУ З ПРІОРИТЕТОМ)
+        # ============================================================
+        elif "Вибір документу" in choice:
+            lbl_info = ctk.CTkLabel(
+                self.dynamic_frame,
+                text="📁 Пошук документів за двома областями екрана з пріоритетом:\n"
+                     "Якщо назва файлу може з'явитися в одній із двох зон списку або таблиці.",
+                font=ctk.CTkFont(size=12),
+                text_color="#94a3b8",
+                justify="left"
+            )
+            lbl_info.pack(anchor="w", padx=14, pady=(10, 6))
+
+            # Область 1
+            btn_area1 = ctk.CTkButton(
+                self.dynamic_frame,
+                text="🎯 Протягнути Область 1 (Основна)",
+                font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                fg_color="#0891b2",
+                hover_color="#0e7490",
+                height=32,
+                command=lambda: self._snip_for_document_area(1)
+            )
+            btn_area1.pack(fill="x", padx=14, pady=4)
+
+            self.lbl_area1_info = ctk.CTkLabel(
+                self.dynamic_frame,
+                text=f"Область 1: {self.area_rect_1}" if self.area_rect_1 else "Область 1: (не задано)",
+                font=ctk.CTkFont(size=11),
+                text_color="#38bdf8" if self.area_rect_1 else "#94a3b8"
+            )
+            self.lbl_area1_info.pack(anchor="w", padx=16, pady=(0, 6))
+
+            # Область 2
+            btn_area2 = ctk.CTkButton(
+                self.dynamic_frame,
+                text="🎯 Протягнути Область 2 (Альтернативна)",
+                font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                fg_color="#0d9488",
+                hover_color="#0f766e",
+                height=32,
+                command=lambda: self._snip_for_document_area(2)
+            )
+            btn_area2.pack(fill="x", padx=14, pady=4)
+
+            self.lbl_area2_info = ctk.CTkLabel(
+                self.dynamic_frame,
+                text=f"Область 2: {self.area_rect_2}" if self.area_rect_2 else "Область 2: (не задано)",
+                font=ctk.CTkFont(size=11),
+                text_color="#2dd4bf" if self.area_rect_2 else "#94a3b8"
+            )
+            self.lbl_area2_info.pack(anchor="w", padx=16, pady=(0, 6))
+
+            # Пріоритет пошуку
+            lbl_priority = ctk.CTkLabel(self.dynamic_frame, text="Пріоритет пошуку файлів:", font=ctk.CTkFont(size=12))
+            lbl_priority.pack(anchor="w", padx=14, pady=(4, 2))
+
+            self.priority_options = [
+                "🥇 Спочатку Область 1, якщо не знайдено ➔ Область 2",
+                "🥈 Спочатку Область 2, якщо не знайдено ➔ Область 1",
+                "🔄 Об'єднати файли з обох областей"
+            ]
+            self.combo_priority = ctk.CTkComboBox(
+                self.dynamic_frame,
+                values=self.priority_options,
+                state="readonly",
+                height=30
+            )
+            pr = getattr(self.action, "search_priority", "area_1_first")
+            if pr == "area_2_first":
+                self.combo_priority.set(self.priority_options[1])
+            elif pr == "both":
+                self.combo_priority.set(self.priority_options[2])
+            else:
+                self.combo_priority.set(self.priority_options[0])
+            self.combo_priority.pack(fill="x", padx=14, pady=(0, 8))
+
+            # Чекбокс контекстного меню
+            self.chk_show_menu = ctk.CTkCheckBox(
+                self.dynamic_frame,
+                text="Показувати спливаюче контекстне меню файлів для вибору",
+                font=ctk.CTkFont(size=12),
+                onvalue=True,
+                offvalue=False
+            )
+            if getattr(self.action, "show_file_menu", True):
+                self.chk_show_menu.select()
+            self.chk_show_menu.pack(anchor="w", padx=14, pady=4)
+
+        # ============================================================
+        # 4. ОЧІКУВАННЯ ПІДТВЕРДЖЕННЯ (CHECKPOINT)
+        # ============================================================
+        elif "Очікування підтвердження" in choice:
+            lbl_title = ctk.CTkLabel(self.dynamic_frame, text="Назва точки перевірки:", font=ctk.CTkFont(size=12))
+            lbl_title.pack(anchor="w", padx=14, pady=(10, 2))
+            self.entry_cp_title = ctk.CTkEntry(self.dynamic_frame, height=30, placeholder_text="Перевірка адреси...")
+            self.entry_cp_title.pack(fill="x", padx=14, pady=(0, 6))
+            self.entry_cp_title.insert(0, self.action.title or "Підтвердження користувача")
+
+            lbl_msg = ctk.CTkLabel(self.dynamic_frame, text="Інструкція / повідомлення оператору:", font=ctk.CTkFont(size=12))
+            lbl_msg.pack(anchor="w", padx=14, pady=(4, 2))
+            self.entry_cp_msg = ctk.CTkTextbox(self.dynamic_frame, height=80)
+            self.entry_cp_msg.pack(fill="x", padx=14, pady=(0, 10))
+            self.entry_cp_msg.insert("1.0", self.action.message or "Перевірте дані на екрані та натисніть 'Продовжити'.")
+
+        # ============================================================
+        # 5. ПРОКРУТКА ДО НИЗУ
+        # ============================================================
+        elif "Прокрутка" in choice:
+            lbl_info = ctk.CTkLabel(
+                self.dynamic_frame,
+                text="📜 Автоматична прокрутка списку до самого кінця.\n"
+                     "Використовує коліщатко миші та клавіші PageDown/End для 100% гарантованого переходу вниз.",
+                font=ctk.CTkFont(size=12),
+                text_color="#94a3b8",
+                justify="left"
+            )
+            lbl_info.pack(anchor="w", padx=14, pady=16)
+
+    # ============================================================
+    # ІНТЕРАКТИВНЕ ВИДІЛЕННЯ ОБЛАСТЕЙ МИШКОЮ (SNIP TOOLS)
+    # ============================================================
+    def _run_snip(self, title: str, on_done: Callable[[Optional[Tuple[int, int, int, int]], Optional[np.ndarray]], None]):
+        # Обов'язково звільняємо модальний grab, інакше приховане вікно блокує всі події миші!
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.withdraw()
+        if self.master:
+            self.master.withdraw()
+
+        def callback(rect, crop):
+            def restore():
+                if self.master:
+                    self.master.deiconify()
+                self.deiconify()
+                self.lift()
+                self.focus_force()
+                try:
+                    self.grab_set()
+                except Exception:
+                    pass
+                on_done(rect, crop)
+
+            self.after(50, restore)
+
+        self.after(80, lambda: ScreenRegionSelector(title=title, on_selected=callback))
+
+    def _snip_for_area(self):
+        def on_done(rect, crop):
+            if rect:
+                self.area_rect_1 = rect
+                cx = (rect[0] + rect[2]) // 2
+                cy = (rect[1] + rect[3]) // 2
+                self.action.x = cx
+                self.action.y = cy
+                self.action.area_rect_1 = rect
+                self.lbl_area_coords.configure(
+                    text=f"✅ Область: ({rect[0]}, {rect[1]}) ➔ ({rect[2]}, {rect[3]})\nЦентр кліку: ({cx}, {cy})",
+                    text_color="#38bdf8"
+                )
+        self._run_snip("Протягніть область списку/панелі для кліку", on_done)
+
+    def _snip_for_element(self):
+        def on_done(rect, crop):
+            if rect and crop is not None:
+                x1, y1, x2, y2 = rect
+                w = x2 - x1
+                h = y2 - y1
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+                
+                # Кодуємо знімок у base64
+                success, buf = cv2.imencode('.png', crop)
+                if success:
+                    self.template_b64 = base64.b64encode(buf).decode('utf-8')
+                    self.template_width = int(w)
+                    self.template_height = int(h)
+                    self.action.template_b64 = self.template_b64
+                    self.action.template_width = int(w)
+                    self.action.template_height = int(h)
+                    self.action.template_offset_x = int(w // 2)
+                    self.action.template_offset_y = int(h // 2)
+                    self.action.x = cx
+                    self.action.y = cy
+                    
+                    self.lbl_elem_status.configure(
+                        text=f"✅ Знімок захоплено ({w}x{h} px) на ({cx}, {cy})",
+                        text_color="#10b981"
+                    )
+
+                    # Фонове авторозпізнавання тексту через Gemini Vision (без зависання інтерфейсу)
+                    if HAS_GEMINI_OCR and is_gemini_available():
+                        self.lbl_elem_status.configure(
+                            text=f"✅ Знімок ({w}x{h} px) | 🤖 Розпізнавання тексту елемента...",
+                            text_color="#38bdf8"
+                        )
+                        def run_ocr():
+                            try:
+                                extracted = extract_element_text_from_crop(crop)
+                                if extracted and hasattr(self, "entry_element_text"):
+                                    self.after(0, lambda: (
+                                        self.entry_element_text.delete(0, "end"),
+                                        self.entry_element_text.insert(0, extracted),
+                                        self.lbl_elem_status.configure(
+                                            text=f"✅ Знімок ({w}x{h} px) | Текст: \"{extracted}\"",
+                                            text_color="#10b981"
+                                        )
+                                    ))
+                                else:
+                                    self.after(0, lambda: self.lbl_elem_status.configure(
+                                        text=f"✅ Знімок захоплено ({w}x{h} px) на ({cx}, {cy})",
+                                        text_color="#10b981"
+                                    ))
+                            except Exception:
+                                pass
+                        threading.Thread(target=run_ocr, daemon=True).start()
+
+        self._run_snip("Виділіть кнопку або пункт меню рамкою", on_done)
+
+    def _snip_for_document_area(self, area_num: int):
+        def on_done(rect, crop):
+            if rect:
+                if area_num == 1:
+                    self.area_rect_1 = rect
+                    self.action.area_rect_1 = rect
+                    self.lbl_area1_info.configure(
+                        text=f"✅ Область 1: ({rect[0]}, {rect[1]}) ➔ ({rect[2]}, {rect[3]})",
+                        text_color="#38bdf8"
+                    )
+                else:
+                    self.area_rect_2 = rect
+                    self.action.area_rect_2 = rect
+                    self.lbl_area2_info.configure(
+                        text=f"✅ Область 2: ({rect[0]}, {rect[1]}) ➔ ({rect[2]}, {rect[3]})",
+                        text_color="#2dd4bf"
+                    )
+        self._run_snip(f"Протягніть Область {area_num} для пошуку документів", on_done)
+
+    # ============================================================
+    # ЗБЕРЕЖЕННЯ ПАРАМЕТРІВ
+    # ============================================================
     def _save(self):
         try:
             self.action.delay_before = float(self.entry_delay.get())
         except ValueError:
-            pass
+            self.action.delay_before = 0.5
 
-        if self.entry_title:
-            self.action.title = self.entry_title.get()
-        if self.entry_msg:
-            self.action.message = self.entry_msg.get("1.0", "end-1c")
+        self.action.comment = self.entry_comment.get().strip()
+        choice = self.combo_type.get()
 
-        if self.chk_vision:
-            self.action.use_vision = self.chk_vision.get()
-        if self.entry_conf:
-            try:
-                self.action.confidence = float(self.entry_conf.get())
-            except ValueError:
-                pass
+        if "Вибір області" in choice:
+            self.action.type = "area_click"
+            self.action.target_type = "area"
+            self.action.area_rect_1 = self.area_rect_1
+            if self.area_rect_1:
+                self.action.x = (self.area_rect_1[0] + self.area_rect_1[2]) // 2
+                self.action.y = (self.area_rect_1[1] + self.area_rect_1[3]) // 2
+            self.action.use_vision = False
 
-        self.on_save(self.action)
+        elif "Клік по елементу" in choice:
+            btn_choice = self.combo_btn.get()
+            if "Правий" in btn_choice:
+                self.action.type = "menu_click"
+                self.action.target_type = "menu_item"
+                self.action.button = "right"
+            elif "Подвійний" in btn_choice:
+                self.action.type = "double_click"
+                self.action.target_type = "element"
+                self.action.button = "left"
+            else:
+                self.action.type = "click"
+                self.action.target_type = "element"
+                self.action.button = "left"
+
+            if hasattr(self, "entry_element_text"):
+                self.action.element_text = self.entry_element_text.get().strip()
+            if hasattr(self, "chk_use_vision"):
+                self.action.use_vision = bool(self.chk_use_vision.get())
+
+            if self.template_b64:
+                self.action.template_b64 = self.template_b64
+                self.action.template_width = self.template_width
+                self.action.template_height = self.template_height
+
+        elif "Вибір документу" in choice:
+            self.action.type = "file_selection"
+            self.action.target_type = "file_item"
+            self.action.area_rect_1 = self.area_rect_1
+            self.action.area_rect_2 = self.area_rect_2
+
+            pr_choice = self.combo_priority.get()
+            if "Область 2, якщо" in pr_choice:
+                self.action.search_priority = "area_2_first"
+            elif "Об'єднати" in pr_choice:
+                self.action.search_priority = "both"
+            else:
+                self.action.search_priority = "area_1_first"
+
+            if hasattr(self, "chk_show_menu"):
+                self.action.show_file_menu = bool(self.chk_show_menu.get())
+
+        elif "Очікування підтвердження" in choice:
+            self.action.type = "checkpoint"
+            if hasattr(self, "entry_cp_title"):
+                self.action.title = self.entry_cp_title.get().strip()
+            if hasattr(self, "entry_cp_msg"):
+                self.action.message = self.entry_cp_msg.get("1.0", "end-1c").strip()
+
+        elif "Прокрутка" in choice:
+            self.action.type = "scroll_to_bottom"
+            self.action.scroll_to_bottom = True
+
+        if self.on_save:
+            self.on_save(self.action)
         self.destroy()
+
+
+class AddActionDialog(ActionConfigDialog):
+    """Діалог додавання нової дії до сценарію."""
+    def __init__(self, master, on_save: Callable[[WorkflowAction], None]):
+        super().__init__(master, action=None, on_save=on_save, is_new=True)
+
+
+class EditActionDialog(ActionConfigDialog):
+    """Діалог редагування існуючої дії сценарію."""
+    def __init__(self, master, action: WorkflowAction, on_save: Callable[[WorkflowAction], None]):
+        super().__init__(master, action=action, on_save=on_save, is_new=False)
+
+
+
+class FileSelectionContextMenu(ctk.CTkToplevel):
+    """
+    Контекстне меню / спливаюче вікно для відображення списку знайдених на екрані файлів,
+    щоб оператор міг обрати потрібний файл і продовжити виконання сценарію.
+    """
+    def __init__(
+        self,
+        master,
+        files: list,
+        on_file_selected: Callable[[Optional[dict]], None]
+    ):
+        super().__init__(master)
+        self.files = files or []
+        self.on_file_selected = on_file_selected
+        self.chosen_file = None
+        self.responded = False
+
+        self.title("Контекстне меню: Знайдені файли")
+        self.geometry("560x420")
+        self.resizable(False, False)
+        
+        self.attributes("-topmost", True)
+        self.lift()
+        self.focus_force()
+        self.grab_set()
+
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        w = 560
+        h = 420
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+        container = ctk.CTkFrame(self, corner_radius=12, fg_color=("#1e293b", "#0f172a"))
+        container.pack(fill="both", expand=True, padx=12, pady=12)
+
+        # Заголовок
+        lbl_head = ctk.CTkLabel(
+            container,
+            text="📁 Список знайдених на екрані файлів",
+            font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"),
+            text_color="#38bdf8"
+        )
+        lbl_head.pack(anchor="w", padx=16, pady=(12, 2))
+
+        count_text = f"Знайдено {len(self.files)} файлів/рядків. Оберіть файл для продовження або натисніть 'Останній внизу':"
+        lbl_sub = ctk.CTkLabel(
+            container,
+            text=count_text,
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color="#94a3b8"
+        )
+        lbl_sub.pack(anchor="w", padx=16, pady=(0, 8))
+
+        # Список файлів у прокручуваному фреймі
+        self.scroll_frame = ctk.CTkScrollableFrame(container, height=220, fg_color=("#0f172a", "#1e293b"))
+        self.scroll_frame.pack(fill="both", expand=True, padx=16, pady=4)
+
+        if not self.files:
+            lbl_none = ctk.CTkLabel(
+                self.scroll_frame,
+                text="⚠️ Файлів автоматично не розпізнано.\nВи можете вибрати останній рядок внизу або пропустити крок.",
+                font=ctk.CTkFont(family="Segoe UI", size=13),
+                text_color="#f59e0b"
+            )
+            lbl_none.pack(pady=40)
+        else:
+            # Табличний заголовок
+            header = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
+            header.grid_columnconfigure(0, weight=1)
+            header.grid_columnconfigure(1, weight=5)
+            header.grid_columnconfigure(2, weight=2)
+            header.grid_columnconfigure(3, weight=2)
+            ctk.CTkLabel(header, text=" ", width=24).grid(row=0, column=0)
+            ctk.CTkLabel(header, text="Назва файлу", font=ctk.CTkFont(size=12, weight="bold"), text_color="#94a3b8").grid(row=0, column=1, padx=4, sticky="w")
+            ctk.CTkLabel(header, text="X", font=ctk.CTkFont(size=12, weight="bold"), text_color="#94a3b8").grid(row=0, column=2, padx=4, sticky="w")
+            ctk.CTkLabel(header, text="Y", font=ctk.CTkFont(size=12, weight="bold"), text_color="#94a3b8").grid(row=0, column=3, padx=4, sticky="w")
+            header.pack(fill="x", pady=(4,2), padx=8)
+
+            for idx, f in enumerate(self.files, start=1):
+                name = f.get("name", f"Файл #{idx}")
+                fx = f.get("x", 0)
+                fy = f.get("y", 0)
+
+                row = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
+                row.grid_columnconfigure(0, weight=1)
+                row.grid_columnconfigure(1, weight=5)
+                row.grid_columnconfigure(2, weight=2)
+                row.grid_columnconfigure(3, weight=2)
+
+                btn = ctk.CTkButton(
+                    row,
+                    text="🟢",
+                    width=24,
+                    height=24,
+                    fg_color="#10b981",
+                    hover_color="#059669",
+                    command=lambda file_dict=f: self._select_file(file_dict)
+                )
+                btn.grid(row=0, column=0, padx=2, sticky="w")
+                ctk.CTkLabel(row, text=name, font=ctk.CTkFont(family="Segoe UI", size=12), text_color="#f8fafc").grid(row=0, column=1, padx=4, sticky="w")
+                ctk.CTkLabel(row, text=str(fx), font=ctk.CTkFont(size=12), text_color="#f8fafc").grid(row=0, column=2, padx=4, sticky="w")
+                ctk.CTkLabel(row, text=str(fy), font=ctk.CTkFont(size=12), text_color="#f8fafc").grid(row=0, column=3, padx=4, sticky="w")
+                row.pack(fill="x", pady=2, padx=4)
+
+        # Панель дій
+        btn_bar = ctk.CTkFrame(container, fg_color="transparent")
+        btn_bar.pack(fill="x", padx=16, pady=(10, 6))
+
+        # Кнопка швидкого вибору останнього файлу (внизу списку)
+        btn_bottom = ctk.CTkButton(
+            btn_bar,
+            text="⬇️ Обрати останній (внизу)",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            fg_color="#059669",
+            hover_color="#047857",
+            height=36,
+            command=self._select_bottom_file
+        )
+        btn_bottom.pack(side="left", padx=(0, 6))
+
+        btn_skip = ctk.CTkButton(
+            btn_bar,
+            text="⏩ Пропустити крок",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            fg_color="#475569",
+            hover_color="#64748b",
+            height=36,
+            width=120,
+            command=lambda: self._select_file(None)
+        )
+        btn_skip.pack(side="left", padx=4)
+
+        btn_abort = ctk.CTkButton(
+            btn_bar,
+            text="⏹ Зупинити (Esc)",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            fg_color="#dc2626",
+            hover_color="#b91c1c",
+            height=36,
+            width=120,
+            command=self._abort
+        )
+        btn_abort.pack(side="right")
+
+        self.bind("<Escape>", lambda e: self._abort())
+        self.bind("<Return>", lambda e: self._select_bottom_file())
+        self.protocol("WM_DELETE_WINDOW", self._abort)
+
+    def _select_file(self, file_dict: Optional[dict]):
+        if self.responded:
+            return
+        self.responded = True
+        try:
+            self.grab_release()
+            self.destroy()
+        except Exception:
+            pass
+        self.on_file_selected(file_dict)
+
+    def _select_bottom_file(self):
+        """Обирає останній файл зі списку (найнижчий рядок на екрані)."""
+        if self.files:
+            # Останній файл або той, що має найбільшу Y координату
+            bottom_file = max(self.files, key=lambda f: f.get("y", 0))
+            self._select_file(bottom_file)
+        else:
+            self._select_file(None)
+
+    def _abort(self):
+        if self.responded:
+            return
+        self.responded = True
+        try:
+            self.grab_release()
+            self.destroy()
+        except Exception:
+            pass
+        self.on_file_selected(None)
+
