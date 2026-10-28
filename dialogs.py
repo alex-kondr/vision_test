@@ -1006,3 +1006,446 @@ class FileSelectionContextMenu(ctk.CTkToplevel):
             pass
         self.on_file_selected(None)
 
+
+class RetrainChunkDialog(ctk.CTkToplevel):
+    """
+    Діалогове вікно вибору початкової точки та діапазону кроків
+    для повторного навчання (донавчання шматками) Gemini Vision / Smart Vision.
+    """
+    def __init__(
+        self,
+        master,
+        actions: list,
+        initial_step_idx: int = 0,
+        on_confirm: Optional[Callable[[int, Optional[int]], None]] = None
+    ):
+        super().__init__(master)
+        self.actions = actions
+        self.on_confirm = on_confirm
+        self.responded = False
+        
+        self.title("Донавчання дій (повторне навчання шматками)")
+        self.geometry("640x520")
+        self.minsize(580, 480)
+        self.attributes("-topmost", True)
+        self.lift()
+        self.focus_force()
+        self.grab_set()
+
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        w = 640
+        h = 520
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+        self._build_ui(initial_step_idx)
+
+    def _build_ui(self, initial_step_idx: int):
+        total = len(self.actions)
+        
+        header = ctk.CTkFrame(self, corner_radius=10, fg_color=("#1e1b4b", "#0f0d24"))
+        header.pack(fill="x", padx=16, pady=(16, 10))
+
+        lbl_title = ctk.CTkLabel(
+            header,
+            text="🧠 Донавчання (Повторне навчання шматками)",
+            font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
+            text_color="#c084fc"
+        )
+        lbl_title.pack(anchor="w", padx=14, pady=(10, 2))
+
+        lbl_desc = ctk.CTkLabel(
+            header,
+            text="Оберіть точку початку та шматок кроків для повторної демонстрації дій.\nНові знімки додадуться до банку Gemini Vision, що підвищить надійність розпізнавання.",
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            text_color="#94a3b8",
+            justify="left"
+        )
+        lbl_desc.pack(anchor="w", padx=14, pady=(0, 10))
+
+        content = ctk.CTkFrame(self, corner_radius=10)
+        content.pack(fill="both", expand=True, padx=16, pady=4)
+
+        # 1. Початковий крок
+        row_start = ctk.CTkFrame(content, fg_color="transparent")
+        row_start.pack(fill="x", padx=14, pady=(10, 4))
+
+        ctk.CTkLabel(
+            row_start,
+            text="Почати з кроку:",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            width=130,
+            anchor="w"
+        ).pack(side="left")
+
+        self.step_options = [
+            f"Крок {i+1}: [{a.type}] {a.element_text or a.comment or a.key or ('Область' if getattr(a, 'target_type', '') == 'area' else '')}"[:60]
+            for i, a in enumerate(self.actions)
+        ]
+        
+        init_val = self.step_options[min(max(0, initial_step_idx), total - 1)] if self.step_options else ""
+        self.combo_start = ctk.CTkComboBox(
+            row_start,
+            values=self.step_options,
+            width=440,
+            height=32,
+            command=self._on_selection_changed,
+            state="readonly"
+        )
+        if init_val:
+            self.combo_start.set(init_val)
+        self.combo_start.pack(side="left", fill="x", expand=True)
+
+        # 2. Діапазон (до якого кроку)
+        row_scope = ctk.CTkFrame(content, fg_color="transparent")
+        row_scope.pack(fill="x", padx=14, pady=4)
+
+        ctk.CTkLabel(
+            row_scope,
+            text="Діапазон шматка:",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            width=130,
+            anchor="w"
+        ).pack(side="left")
+
+        self.scope_var = ctk.StringVar(value="to_end")
+
+        rb_to_end = ctk.CTkRadioButton(
+            row_scope,
+            text="До кінця сценарію",
+            variable=self.scope_var,
+            value="to_end",
+            command=self._on_selection_changed
+        )
+        rb_to_end.pack(side="left", padx=(0, 15))
+
+        rb_chunk = ctk.CTkRadioButton(
+            row_scope,
+            text="До кроку:",
+            variable=self.scope_var,
+            value="chunk",
+            command=self._on_selection_changed
+        )
+        rb_chunk.pack(side="left", padx=(0, 6))
+
+        self.combo_end = ctk.CTkComboBox(
+            row_scope,
+            values=self.step_options,
+            width=220,
+            height=30,
+            command=self._on_selection_changed,
+            state="readonly"
+        )
+        end_init_idx = min(initial_step_idx + 2, total - 1)
+        if self.step_options:
+            self.combo_end.set(self.step_options[end_init_idx])
+        self.combo_end.pack(side="left", fill="x", expand=True)
+
+        # 3. Список дій у вибраному шматку
+        lbl_preview = ctk.CTkLabel(
+            content,
+            text="📋 Кроки, що входять у вибраний шматок для донавчання:",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            anchor="w"
+        )
+        lbl_preview.pack(fill="x", padx=14, pady=(8, 2))
+
+        self.txt_preview = ctk.CTkTextbox(content, height=130, font=("Consolas", 10))
+        self.txt_preview.pack(fill="both", expand=True, padx=14, pady=(2, 6))
+
+        self.lbl_summary = ctk.CTkLabel(
+            content,
+            text="",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            text_color="#38bdf8",
+            anchor="w"
+        )
+        self.lbl_summary.pack(fill="x", padx=14, pady=(0, 8))
+
+        # 4. Панель кнопок
+        btn_bar = ctk.CTkFrame(self, fg_color="transparent")
+        btn_bar.pack(fill="x", padx=16, pady=(6, 16))
+
+        btn_cancel = ctk.CTkButton(
+            btn_bar,
+            text="Скасувати",
+            font=ctk.CTkFont(size=12),
+            fg_color="#334155",
+            hover_color="#475569",
+            width=110,
+            height=36,
+            command=self._cancel
+        )
+        btn_cancel.pack(side="right", padx=(8, 0))
+
+        btn_start = ctk.CTkButton(
+            btn_bar,
+            text="🚀 Почати донавчання шматка (F10 — завершити)",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#7c3aed",
+            hover_color="#6d28d9",
+            height=36,
+            command=self._confirm
+        )
+        btn_start.pack(side="right")
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda e: self._cancel())
+
+        self._update_preview()
+
+    def _get_indices(self) -> Tuple[int, Optional[int]]:
+        start_idx = 0
+        val_start = self.combo_start.get()
+        if val_start in self.step_options:
+            start_idx = self.step_options.index(val_start)
+
+        end_idx = None
+        if self.scope_var.get() == "chunk":
+            val_end = self.combo_end.get()
+            if val_end in self.step_options:
+                end_step_num = self.step_options.index(val_end)
+                end_idx = max(start_idx + 1, end_step_num + 1)
+        return start_idx, end_idx
+
+    def _on_selection_changed(self, *args):
+        self._update_preview()
+
+    def _update_preview(self):
+        start_idx, end_idx = self._get_indices()
+        total = len(self.actions)
+        eff_end = total if end_idx is None else min(end_idx, total)
+        if eff_end <= start_idx:
+            eff_end = min(start_idx + 1, total)
+
+        slice_actions = self.actions[start_idx:eff_end]
+        vision_count = 0
+
+        self.txt_preview.configure(state="normal")
+        self.txt_preview.delete("1.0", "end")
+
+        for idx, act in enumerate(slice_actions, start=start_idx + 1):
+            bank_count = len(getattr(act, "template_bank", []) or [])
+            if act.template_b64:
+                vision_info = f"[🎯 Vision: банк x{bank_count}]"
+                vision_count += 1
+            elif act.uia_name:
+                vision_info = f"[⚡ UIA: {act.uia_control_type or 'Control'}]"
+            elif getattr(act, "target_type", "") == "area":
+                vision_info = "[🔲 Область]"
+            else:
+                vision_info = "[Координати/Клавіша]"
+
+            line = f"Крок {idx:2d}: {act.type:12s} | {act.get_display_text()[:45]:45s} {vision_info}\n"
+            self.txt_preview.insert("end", line)
+
+        self.txt_preview.configure(state="disabled")
+        scope_desc = f"кроки {start_idx + 1} ... {eff_end}"
+        self.lbl_summary.configure(
+            text=f"ℹ️ У вибраному шматку ({scope_desc}): {len(slice_actions)} дій, з них {vision_count} мають знімки Vision для поповнення банку."
+        )
+
+    def _confirm(self):
+        if self.responded:
+            return
+        self.responded = True
+        start_idx, end_idx = self._get_indices()
+        try:
+            self.grab_release()
+            self.destroy()
+        except Exception:
+            pass
+        if self.on_confirm:
+            self.on_confirm(start_idx, end_idx)
+
+    def _cancel(self):
+        if self.responded:
+            return
+        self.responded = True
+        try:
+            self.grab_release()
+            self.destroy()
+        except Exception:
+            pass
+
+
+class AppendActionsDialog(ctk.CTkToplevel):
+    """
+    Діалогове вікно вибору позиції для дозапису дій у сценарій
+    (в кінець або після конкретного кроку).
+    """
+    def __init__(
+        self,
+        master,
+        actions: list,
+        selected_idx: Optional[int] = None,
+        on_confirm: Optional[Callable[[int], None]] = None
+    ):
+        super().__init__(master)
+        self.actions = actions
+        self.on_confirm = on_confirm
+        self.responded = False
+        
+        self.title("Дозапис дій у сценарій")
+        self.geometry("540x360")
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+        self.lift()
+        self.focus_force()
+        self.grab_set()
+
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        w = 540
+        h = 360
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+        self._build_ui(selected_idx)
+
+    def _build_ui(self, selected_idx: Optional[int]):
+        total = len(self.actions)
+        
+        header = ctk.CTkFrame(self, corner_radius=10, fg_color=("#1e293b", "#0f172a"))
+        header.pack(fill="x", padx=16, pady=(16, 10))
+
+        lbl_title = ctk.CTkLabel(
+            header,
+            text="⏺➕ Дозапис дій у сценарій",
+            font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
+            text_color="#f87171"
+        )
+        lbl_title.pack(anchor="w", padx=14, pady=(10, 2))
+
+        lbl_desc = ctk.CTkLabel(
+            header,
+            text="Запишіть нові дії (кліки, клавіші, очікування) та додайте їх до сценарію.\nВи можете вставити їх у кінець або після обраного кроку.",
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            text_color="#94a3b8",
+            justify="left"
+        )
+        lbl_desc.pack(anchor="w", padx=14, pady=(0, 10))
+
+        content = ctk.CTkFrame(self, corner_radius=10)
+        content.pack(fill="both", expand=True, padx=16, pady=4)
+
+        ctk.CTkLabel(
+            content,
+            text="Куди додати нові записані дії?",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold")
+        ).pack(anchor="w", padx=14, pady=(10, 6))
+
+        self.target_var = ctk.StringVar(value="selected" if selected_idx is not None else "end")
+
+        rb_end = ctk.CTkRadioButton(
+            content,
+            text=f"В кінець списку дій (після кроку №{total})",
+            variable=self.target_var,
+            value="end",
+            font=ctk.CTkFont(size=12)
+        )
+        rb_end.pack(anchor="w", padx=14, pady=5)
+
+        self.step_options = [
+            f"Крок {i+1}: [{a.type}] {a.element_text or a.comment or a.key or ''}"[:55]
+            for i, a in enumerate(self.actions)
+        ]
+
+        rb_after_sel = ctk.CTkRadioButton(
+            content,
+            text="Після вказаного кроку:",
+            variable=self.target_var,
+            value="selected",
+            font=ctk.CTkFont(size=12)
+        )
+        rb_after_sel.pack(anchor="w", padx=14, pady=(5, 2))
+
+        init_step_idx = selected_idx if selected_idx is not None else max(0, total - 1)
+        self.combo_step = ctk.CTkComboBox(
+            content,
+            values=self.step_options,
+            width=470,
+            height=30,
+            state="readonly"
+        )
+        if self.step_options:
+            self.combo_step.set(self.step_options[min(init_step_idx, total - 1)])
+        self.combo_step.pack(anchor="w", padx=32, pady=(2, 10))
+
+        # Підказка
+        lbl_hint = ctk.CTkLabel(
+            content,
+            text="💡 Натисніть F10 під час запису, щоб зупинити його та зберегти кроки.",
+            font=ctk.CTkFont(size=11),
+            text_color="#38bdf8"
+        )
+        lbl_hint.pack(anchor="w", padx=14, pady=(0, 6))
+
+        # Кнопки
+        btn_bar = ctk.CTkFrame(self, fg_color="transparent")
+        btn_bar.pack(fill="x", padx=16, pady=(6, 16))
+
+        btn_cancel = ctk.CTkButton(
+            btn_bar,
+            text="Скасувати",
+            font=ctk.CTkFont(size=12),
+            fg_color="#334155",
+            hover_color="#475569",
+            width=110,
+            height=36,
+            command=self._cancel
+        )
+        btn_cancel.pack(side="right", padx=(8, 0))
+
+        btn_start = ctk.CTkButton(
+            btn_bar,
+            text="⏺ Почати дозапис дій (F10 — стоп)",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#ef4444",
+            hover_color="#dc2626",
+            height=36,
+            command=self._confirm
+        )
+        btn_start.pack(side="right")
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda e: self._cancel())
+
+    def _get_insert_index(self) -> int:
+        total = len(self.actions)
+        if self.target_var.get() == "end" or not self.step_options:
+            return total
+        val = self.combo_step.get()
+        if val in self.step_options:
+            idx = self.step_options.index(val)
+            return idx + 1  # вставляємо після цього кроку
+        return total
+
+    def _confirm(self):
+        if self.responded:
+            return
+        self.responded = True
+        insert_idx = self._get_insert_index()
+        try:
+            self.grab_release()
+            self.destroy()
+        except Exception:
+            pass
+        if self.on_confirm:
+            self.on_confirm(insert_idx)
+
+    def _cancel(self):
+        if self.responded:
+            return
+        self.responded = True
+        try:
+            self.grab_release()
+            self.destroy()
+        except Exception:
+            pass
+

@@ -49,6 +49,8 @@ class ActionRecorder:
         
         # Існуючий сценарій для об'єднання банку шаблонів (при повторному навчанні)
         self._existing_workflow: Optional[Any] = None
+        self.retrain_start_idx: int = 0
+        self.retrain_end_idx: Optional[int] = None
 
     def set_target_type(self, target_type: str):
         """Встановлює тип наступного кліку ('element', 'area', 'menu_item')."""
@@ -57,43 +59,67 @@ class ActionRecorder:
             self.on_target_type_changed(target_type)
 
 
-    def set_existing_workflow(self, workflow: Any):
-        """Встановлює існуючий сценарій для об'єднання банку шаблонів при повторному навчанні."""
+    def set_existing_workflow(self, workflow: Any, start_idx: int = 0, end_idx: Optional[int] = None):
+        """Встановлює існуючий сценарій та діапазон кроків для донавчання (шматками)."""
         self._existing_workflow = workflow
+        self.retrain_start_idx = max(0, start_idx)
+        self.retrain_end_idx = end_idx
 
-    def merge_template_banks(self, new_actions: List[WorkflowAction]) -> List[WorkflowAction]:
+    def merge_template_banks(self, new_actions: List[WorkflowAction]) -> Tuple[List[WorkflowAction], int, List[WorkflowAction]]:
         """
-        Об'єднує банки шаблонів з попереднього запису (існуючого сценарію) з новими знімками.
+        Об'єднує банки шаблонів з попереднього запису (існуючого сценарію) з новими знімками,
+        починаючи з вказаного кроку retrain_start_idx і до retrain_end_idx (шматками).
         
-        Алгоритм зіставлення:
-        - Співставляємо нові дії з існуючими за позицією в списку (по-порядку виконання)
-        - Якщо дія знайдена і має шаблон — додаємо новий знімок до існуючого банку
-        - На вихід повертаємо існуючі дії з оновленими банками шаблонів
+        Повертає кортеж:
+        (оновлений_список_дій, кількість_оновлених_дій, залишкові_нові_дії)
         """
         if not self._existing_workflow or not self._existing_workflow.actions:
-            return new_actions
+            return new_actions, 0, []
         
         existing = self._existing_workflow.actions
+        total = len(existing)
+        start_idx = max(0, min(getattr(self, "retrain_start_idx", 0), total - 1))
+        end_idx = total if getattr(self, "retrain_end_idx", None) is None else min(self.retrain_end_idx, total)
+        if end_idx <= start_idx:
+            end_idx = total
+            
         result = []
-        
-        # Проходимо через існуючі дії і знаходимо відповідні нові за типом
-        new_click_actions = [a for a in new_actions if a.type in ("click", "double_click", "right_click") and a.template_b64]
+        new_click_actions = [a for a in new_actions if a.type in ("click", "double_click", "right_click", "menu_click", "area_click") and a.template_b64]
         new_idx = 0
+        updated_count = 0
         
-        for old_action in existing:
+        for idx, old_action in enumerate(existing):
             merged = WorkflowAction.from_dict(old_action.to_dict())  # глибока копія
             
-            if old_action.type in ("click", "double_click", "right_click") and old_action.template_b64:
-                # Шукаємо відповідну нову дію за типом і порядком
-                if new_idx < len(new_click_actions):
-                    new_action = new_click_actions[new_idx]
-                    new_idx += 1
-                    if new_action.template_b64:
-                        merged.add_to_bank(new_action.template_b64)
+            # Якщо крок знаходиться у вибраному для донавчання шматку [start_idx, end_idx)
+            if start_idx <= idx < end_idx:
+                if old_action.type in ("click", "double_click", "right_click", "menu_click", "area_click"):
+                    if new_idx < len(new_click_actions):
+                        new_action = new_click_actions[new_idx]
+                        new_idx += 1
+                        if new_action.template_b64:
+                            merged.add_to_bank(new_action.template_b64)
+                            merged.template_b64 = new_action.template_b64
+                            merged.template_offset_x = new_action.template_offset_x
+                            merged.template_offset_y = new_action.template_offset_y
+                            merged.template_width = new_action.template_width
+                            merged.template_height = new_action.template_height
+                            merged.use_vision = True
+                            merged.x = new_action.x
+                            merged.y = new_action.y
+                            if new_action.element_text and not merged.element_text:
+                                merged.element_text = new_action.element_text
+                            if new_action.uia_name and not merged.uia_name:
+                                merged.uia_name = new_action.uia_name
+                                merged.uia_control_type = new_action.uia_control_type
+                                merged.uia_window = new_action.uia_window
+                                merged.uia_automation_id = new_action.uia_automation_id
+                            updated_count += 1
             
             result.append(merged)
-        
-        return result
+            
+        leftover = new_click_actions[new_idx:]
+        return result, updated_count, leftover
 
     def set_ignored_region(self, x1: int, y1: int, x2: int, y2: int):
         self.ignored_rect = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))

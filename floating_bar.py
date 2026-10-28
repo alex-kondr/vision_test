@@ -18,7 +18,10 @@ class FloatingRecordingBar(ctk.CTkToplevel):
         on_position_changed: Optional[Callable[[int, int, int, int], None]] = None,
         on_set_target_type: Optional[Callable[[str], None]] = None,
         on_add_scroll: Optional[Callable[[], None]] = None,
-        on_add_file_selection: Optional[Callable[[], None]] = None
+        on_add_file_selection: Optional[Callable[[], None]] = None,
+        mode_title: str = "🔴 ЗАПИС",
+        mode_color: str = "#ef4444",
+        info_text: str = ""
     ):
         super().__init__(master)
         
@@ -31,6 +34,10 @@ class FloatingRecordingBar(ctk.CTkToplevel):
         self.on_add_file_selection = on_add_file_selection
         self.is_paused = False
         self.current_target_mode = "element"  # 'element', 'area'
+        self.mode_title = mode_title
+        self.mode_color = mode_color
+        self.info_text = info_text
+        self.action_count = 0
         
         # Вікно поверх усіх інших
         self.attributes("-topmost", True)
@@ -38,7 +45,7 @@ class FloatingRecordingBar(ctk.CTkToplevel):
         
         # Розмір та позиція
         screen_w = self.winfo_screenwidth()
-        bar_w = 840
+        bar_w = 920
         bar_h = 56
         pos_x = max(10, screen_w - bar_w - 20)
         pos_y = 35
@@ -50,7 +57,7 @@ class FloatingRecordingBar(ctk.CTkToplevel):
             corner_radius=12,
             fg_color=("#1e293b", "#0f172a"),
             border_width=2,
-            border_color="#ef4444"
+            border_color=self.mode_color
         )
         self.container.pack(fill="both", expand=True, padx=2, pady=2)
         
@@ -63,13 +70,25 @@ class FloatingRecordingBar(ctk.CTkToplevel):
         # Індикатор стану
         self.lbl_record = ctk.CTkLabel(
             self.container,
-            text="🔴 ЗАПИС",
+            text=self.mode_title,
             font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
-            text_color="#ef4444"
+            text_color=self.mode_color
         )
-        self.lbl_record.pack(side="left", padx=(10, 5), pady=8)
+        self.lbl_record.pack(side="left", padx=(10, 4), pady=8)
         self.lbl_record.bind("<ButtonPress-1>", self._start_drag)
         self.lbl_record.bind("<B1-Motion>", self._on_drag)
+
+        # Додатковий лічильник дій / підказка шматка
+        init_info = f"[{self.info_text}]" if self.info_text else "[0 дій]"
+        self.lbl_info = ctk.CTkLabel(
+            self.container,
+            text=init_info,
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            text_color="#94a3b8"
+        )
+        self.lbl_info.pack(side="left", padx=(0, 6), pady=8)
+        self.lbl_info.bind("<ButtonPress-1>", self._start_drag)
+        self.lbl_info.bind("<B1-Motion>", self._on_drag)
 
         # Перемикач типу кліку: ЕЛЕМЕНТ / ОБЛАСТЬ
         self.btn_mode_element = ctk.CTkButton(
@@ -242,8 +261,8 @@ class FloatingRecordingBar(ctk.CTkToplevel):
             )
             self.btn_checkpoint.configure(state="disabled")
         else:
-            self.lbl_record.configure(text="🔴 ЗАПИС", text_color="#ef4444")
-            self.container.configure(border_color="#ef4444")
+            self.lbl_record.configure(text=self.mode_title, text_color=self.mode_color)
+            self.container.configure(border_color=self.mode_color)
             self.btn_pause.configure(
                 text="⏸ Пауза запису (F9)",
                 fg_color="#334155",
@@ -252,6 +271,11 @@ class FloatingRecordingBar(ctk.CTkToplevel):
             )
             self.btn_checkpoint.configure(state="normal")
         self._update_bounds()
+
+    def update_action_count(self, count: int):
+        self.action_count = count
+        base = f"{self.info_text} | " if self.info_text else ""
+        self.lbl_info.configure(text=f"[{base}{count} дій]")
 
     def show_feedback(self, text: str):
         orig_text = self.btn_checkpoint.cget("text")

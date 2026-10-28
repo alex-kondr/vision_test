@@ -15,7 +15,14 @@ from models import Workflow, WorkflowAction
 from recorder import ActionRecorder
 from player import ActionPlayer
 from floating_bar import FloatingRecordingBar
-from dialogs import CheckpointModalDialog, EditActionDialog, FileSelectionContextMenu, AddActionDialog
+from dialogs import (
+    CheckpointModalDialog,
+    EditActionDialog,
+    FileSelectionContextMenu,
+    AddActionDialog,
+    RetrainChunkDialog,
+    AppendActionsDialog
+)
 
 try:
     from gemini_vision import set_api_key, is_gemini_available

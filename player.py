@@ -52,6 +52,8 @@ class ActionPlayer:
         self.current_step = 0
         self.speed_factor = 1.0
         self.pause_between_cycles = True
+        self.start_step = 0
+        self.end_step: Optional[int] = None
         
         # Подія для очікування відповіді користувача в точці схвалення
         self._checkpoint_event = threading.Event()
@@ -76,8 +78,16 @@ class ActionPlayer:
         self._thread: Optional[threading.Thread] = None
         self._keyboard_controller = pynput.keyboard.Controller()
 
-    def play(self, workflow: Workflow, cycles: int = 1, speed: float = 1.0, pause_between_cycles: bool = True):
-        """Запускає виконання сценарію у фоновому потоці."""
+    def play(
+        self,
+        workflow: Workflow,
+        cycles: int = 1,
+        speed: float = 1.0,
+        pause_between_cycles: bool = True,
+        start_step: int = 0,
+        end_step: Optional[int] = None
+    ):
+        """Запускає виконання сценарію (або його окремої частини) у фоновому потоці."""
         if self.is_running:
             return
             
@@ -86,6 +96,8 @@ class ActionPlayer:
         self.current_cycle = 0
         self.speed_factor = max(0.1, speed)
         self.pause_between_cycles = pause_between_cycles
+        self.start_step = max(0, start_step)
+        self.end_step = end_step
         self.is_running = True
         self.is_paused = False
         self.abort_requested = False
@@ -179,7 +191,14 @@ class ActionPlayer:
                 actions = list(self.workflow.actions)
                 total_steps = len(actions)
                 
-                for idx, action in enumerate(actions):
+                # Визначаємо межі кроків (для перевірки частини або виконання з вибраного кроку)
+                eff_start = min(self.start_step, total_steps)
+                eff_end = total_steps if self.end_step is None else min(self.end_step, total_steps)
+                if eff_end < eff_start:
+                    eff_end = eff_start
+                
+                for idx in range(eff_start, eff_end):
+                    action = actions[idx]
                     if self.abort_requested:
                         break
                         
