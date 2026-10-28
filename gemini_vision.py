@@ -78,7 +78,7 @@ def _b64_to_img(b64: str) -> Optional[np.ndarray]:
     except Exception:
         return None
 
-PREFERRED_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-3.8-flash"]
+PREFERRED_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
 
 def _call_gemini_with_fallback(client: Any, parts: List[Any], max_tokens: int = 256) -> Optional[str]:
@@ -214,11 +214,10 @@ def find_element_with_gemini(
         real_x = int(gx / scale)
         real_y = int(gy / scale)
 
-        click_x = real_x + offset_x - (sample_templates and _get_template_half_w(sample_templates[0]) or 0)
-        click_y = real_y + offset_y - (sample_templates and _get_template_half_h(sample_templates[0]) or 0)
-
-        click_x = max(0, min(sw - 1, click_x))
-        click_y = max(0, min(sh - 1, click_y))
+        # Gemini повертає точний центр елемента на екрані.
+        # Додаткове віднімання половини шаблону викликало промах повз вузькі пункти меню.
+        click_x = max(0, min(sw - 1, real_x))
+        click_y = max(0, min(sh - 1, real_y))
 
         return click_x, click_y, conf
 

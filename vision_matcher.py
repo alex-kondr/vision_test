@@ -1,18 +1,25 @@
 """
-Модуль комп'ютерного зору (Vision Matcher) для пошуку динамічних елементів,
-кнопок, виділених документів та пунктів контекстного меню при їх зміщенні.
+Модуль комп'ютерного зору (Vision Matcher) для пошуку елементів,
+кнопок, виділених документів та пунктів контекстного меню при їх зміщенні на 10-25% або зміні масштабу/теми.
 
-Стратегія пошуку (гібридна):
-  1. Gemini Vision API  — аналізує знімок екрана та банк шаблонів, повертає координати
-  2. OpenCV matchTemplate — швидкий fallback якщо Gemini недоступний або не знайшов елемент
+Гібридна стратегія пошуку (Шар 3):
+  1. Локальний OCR (RapidOCR / Windows winocr) — швидкий пошук за текстом елемента
+     (наприклад, "Додаткові дії"). Повертає точний bounding box без викликів хмарного API.
+  2. Багатомасштабний OpenCV matchTemplate (масштаби 0.8–1.25) на Canny-контурах/краях,
+     що забезпечує стійкість до зміни фону (виділення рядка) та DPI.
+  3. Gemini Vision API — як останній резервний шар.
 """
 import io
+import re
 import base64
 import time
+import logging
 from typing import Optional, Tuple, Dict, Any, List
 import numpy as np
 import cv2
 from PIL import Image, ImageGrab
+
+logger = logging.getLogger("VisionMatcher")
 
 try:
     import mss
@@ -20,7 +27,22 @@ try:
 except ImportError:
     HAS_MSS = False
 
-# Gemini Vision (опціональний)
+# OCR рушії
+try:
+    from rapidocr_onnxruntime import RapidOCR
+    _rapid_ocr = RapidOCR()
+    HAS_RAPID_OCR = True
+except ImportError:
+    _rapid_ocr = None
+    HAS_RAPID_OCR = False
+
+try:
+    import winocr
+    HAS_WINOCR = True
+except ImportError:
+    HAS_WINOCR = False
+
+# Gemini Vision (опціональний резерв)
 try:
     from gemini_vision import find_element_with_gemini, is_gemini_available, detect_files_on_screen
     HAS_GEMINI = True
@@ -29,6 +51,11 @@ except ImportError:
     def is_gemini_available(): return False
     def detect_files_on_screen(*args, **kwargs): return []
 
+try:
+    from uia_manager import UIAManager
+    HAS_UIA = True
+except ImportError:
+    HAS_UIA = False
 
 
 class VisionMatcher:
@@ -38,19 +65,16 @@ class VisionMatcher:
         Робить знімок екрана та повертає numpy array в форматі BGR.
         Безпечно обробляє винятки (наприклад, коли екран заблоковано).
         """
-        # Спроба 1: MSS (найшвидший спосіб захоплення)
         if HAS_MSS:
             try:
                 with mss.mss() as sct:
-                    monitor = sct.monitors[0]  # всі монітори або основний
+                    monitor = sct.monitors[0]
                     sct_img = sct.grab(monitor)
-                    # MSS повертає BGRA
                     img_np = np.array(sct_img)
                     return cv2.cvtColor(img_np, cv2.COLOR_BGRA2BGR)
             except Exception:
                 pass
 
-        # Спроба 2: PIL ImageGrab
         try:
             pil_img = ImageGrab.grab(all_screens=True)
             img_np = np.array(pil_img)
@@ -78,7 +102,6 @@ class VisionMatcher:
 
         h_screen, w_screen = screen_img.shape[:2]
 
-        # Розрахунок прямокутника навколо точки
         half_w = width // 2
         half_h = height // 2
 
@@ -92,7 +115,6 @@ class VisionMatcher:
 
         crop = screen_img[y1:y2, x1:x2]
 
-        # Кодування у base64 PNG
         success, encoded_img = cv2.imencode('.png', crop)
         if not success:
             return None
@@ -113,10 +135,178 @@ class VisionMatcher:
         try:
             img_data = base64.b64decode(b64_str)
             np_arr = np.frombuffer(img_data, np.uint8)
-            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-            return img
+            return cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         except Exception:
             return None
+
+    @staticmethod
+    def find_text_with_ocr(
+        screen_img: np.ndarray,
+        target_text: str,
+        expected_x: Optional[int] = None,
+        expected_y: Optional[int] = None,
+        search_radius: int = 600
+    ) -> Optional[Tuple[int, int, float]]:
+        """
+        Шукає текст target_text на екрані за допомогою локального швидкого OCR (RapidOCR або winocr).
+        Повертає точні координати центру (click_x, click_y, confidence).
+        """
+        if not target_text or not target_text.strip():
+            return None
+
+        sh, sw = screen_img.shape[:2]
+        query = target_text.strip().lower()
+
+        # Якщо вказано очікувану точку — обрізаємо область навколо неї для швидкодії та точності
+        crop_x1, crop_y1 = 0, 0
+        if expected_x is not None and expected_y is not None and search_radius > 0:
+            crop_x1 = max(0, expected_x - search_radius)
+            crop_y1 = max(0, expected_y - search_radius)
+            crop_x2 = min(sw, expected_x + search_radius)
+            crop_y2 = min(sh, expected_y + search_radius)
+            working_img = screen_img[crop_y1:crop_y2, crop_x1:crop_x2]
+        else:
+            working_img = screen_img
+
+        if working_img.size == 0:
+            return None
+
+        # 1. Спроба через RapidOCR (найбільш універсальний, швидкий та точний для кирилиці)
+        if HAS_RAPID_OCR and _rapid_ocr is not None:
+            try:
+                results, _ = _rapid_ocr(working_img)
+                if results:
+                    best_match = None
+                    best_score = 0.0
+
+                    for box, text, score in results:
+                        recognized = text.strip().lower()
+                        # Перевіряємо збіг рядка або входження
+                        match_weight = 0.0
+                        if query in recognized or recognized in query:
+                            match_weight = 1.0
+                        else:
+                            # Перевіряємо збіг слів
+                            words_query = set(re.findall(r'\w+', query))
+                            words_rec = set(re.findall(r'\w+', recognized))
+                            if words_query and words_query.intersection(words_rec):
+                                match_weight = len(words_query.intersection(words_rec)) / len(words_query)
+
+                        if match_weight > 0.4 and match_weight > best_score:
+                            best_score = match_weight
+                            # box: [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+                            pts = np.array(box)
+                            cx = int(np.mean(pts[:, 0])) + crop_x1
+                            cy = int(np.mean(pts[:, 1])) + crop_y1
+                            best_match = (cx, cy, float(score))
+
+                    if best_match:
+                        return best_match
+            except Exception as e:
+                logger.debug(f"RapidOCR помилка пошуку тексту: {e}")
+
+        # 2. Спроба через Windows OCR (winocr)
+        if HAS_WINOCR:
+            try:
+                pil_img = Image.fromarray(cv2.cvtColor(working_img, cv2.COLOR_BGR2RGB))
+                for lang in ["ru", "en-US"]:
+                    try:
+                        ocr_data = winocr.recognize_pil_sync(pil_img, lang)
+                        for line in ocr_data.get("lines", []):
+                            line_text = line.get("text", "").lower()
+                            if query in line_text:
+                                words = line.get("words", [])
+                                if words:
+                                    r = words[0].get("bounding_rect", {})
+                                    cx = int(r.get("x", 0) + r.get("width", 0) / 2) + crop_x1
+                                    cy = int(r.get("y", 0) + r.get("height", 0) / 2) + crop_y1
+                                    return cx, cy, 0.95
+                    except Exception:
+                        continue
+            except Exception as e:
+                logger.debug(f"winocr помилка: {e}")
+
+        return None
+
+    @staticmethod
+    def _find_with_opencv_multiscale(
+        template_b64: str,
+        expected_x: int,
+        expected_y: int,
+        offset_x: int,
+        offset_y: int,
+        confidence: float = 0.70,
+        search_vicinity_radius: int = 400,
+        screen_img: Optional[np.ndarray] = None,
+        template_bank: Optional[List[str]] = None,
+    ) -> Optional[Tuple[int, int, float]]:
+        """
+        Багатомасштабний (0.8–1.25) OpenCV matchTemplate на Canny-контурах (краях).
+        Це усуває залежність від кольору фону (наприклад, коли рядок виділено синім)
+        та масштабування дисплея (DPI 100%, 125%, 150%).
+        """
+        if screen_img is None:
+            return None
+
+        candidates = list(template_bank) if template_bank else []
+        if template_b64 and template_b64 not in candidates:
+            candidates.insert(0, template_b64)
+
+        if not candidates:
+            return None
+
+        s_h, s_w = screen_img.shape[:2]
+
+        # Обмежуємо область пошуку навколо очікуваної точки
+        if search_vicinity_radius > 0:
+            vx1 = max(0, expected_x - search_vicinity_radius)
+            vy1 = max(0, expected_y - search_vicinity_radius)
+            vx2 = min(s_w, expected_x + search_vicinity_radius)
+            vy2 = min(s_h, expected_y + search_vicinity_radius)
+            search_area = screen_img[vy1:vy2, vx1:vx2]
+        else:
+            vx1, vy1 = 0, 0
+            search_area = screen_img
+
+        search_gray = cv2.cvtColor(search_area, cv2.COLOR_BGR2GRAY)
+        search_edges = cv2.Canny(search_gray, 50, 150)
+
+        best_score = 0.0
+        best_coord = None
+        scales = [1.0, 0.9, 1.1, 0.85, 1.15, 0.8, 1.25]
+
+        for tmpl_b64 in candidates:
+            tmpl_img = VisionMatcher.b64_to_image(tmpl_b64)
+            if tmpl_img is None:
+                continue
+
+            orig_h, orig_w = tmpl_img.shape[:2]
+            tmpl_gray = cv2.cvtColor(tmpl_img, cv2.COLOR_BGR2GRAY)
+            tmpl_edges = cv2.Canny(tmpl_gray, 50, 150)
+
+            for scale in scales:
+                new_w = int(orig_w * scale)
+                new_h = int(orig_h * scale)
+
+                if new_w >= search_edges.shape[1] or new_h >= search_edges.shape[0] or new_w < 10 or new_h < 10:
+                    continue
+
+                scaled_edges = cv2.resize(tmpl_edges, (new_w, new_h), interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR)
+
+                res = cv2.matchTemplate(search_edges, scaled_edges, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(res)
+
+                if max_val > best_score:
+                    best_score = max_val
+                    # Центр знайденого елемента
+                    found_cx = vx1 + max_loc[0] + int(offset_x * scale)
+                    found_cy = vy1 + max_loc[1] + int(offset_y * scale)
+                    best_coord = (found_cx, found_cy, max_val)
+
+        if best_coord and best_score >= confidence:
+            return best_coord
+
+        return None
 
     @staticmethod
     def find_element_on_screen(
@@ -125,7 +315,7 @@ class VisionMatcher:
         expected_y: int,
         offset_x: int,
         offset_y: int,
-        confidence: float = 0.75,
+        confidence: float = 0.70,
         search_vicinity_radius: int = 500,
         screen_img: Optional[np.ndarray] = None,
         template_bank: Optional[List[str]] = None,
@@ -135,17 +325,10 @@ class VisionMatcher:
         use_gemini: bool = True,
     ) -> Optional[Tuple[int, int, float]]:
         """
-        Шукає шаблон або семантичний елемент (наприклад, пункт меню 'Додаткові дії') на поточному екрані.
-
-        Стратегія (гібридна):
-          1. Gemini Vision API (якщо доступний та увімкнений):
-             - Шукає за семантичною назвою, типом цілі та зразками зображення
-             - Розуміє зміщення меню або елемента на 10-25%
-          2. OpenCV matchTemplate (fallback):
-             - Шукає в розширеному радіусі очікуваних координат (500px)
-             - Якщо не знайдено — глобальний пошук по всьому екрану
-        
-        Повертає (actual_click_x, actual_click_y, confidence_score) або None.
+        Гібридний пошук елемента на поточному екрані:
+          Шар 3a: OCR за текстом елемента (наприклад, 'Додаткові дії')
+          Шар 3b: Багатомасштабний OpenCV matchTemplate на контурах/краях
+          Шар 3c: Gemini Vision API (якщо локальні методи не знайшли та увімкнено Gemini)
         """
         if screen_img is None:
             screen_img = VisionMatcher.capture_screen_image()
@@ -153,11 +336,39 @@ class VisionMatcher:
         if screen_img is None:
             return None
 
-        # === СТРАТЕГІЯ 1: Gemini Vision ===
+        # === ШАР 3a: Швидкий локальний OCR (пошук за семантичним текстом) ===
+        if element_text and element_text.strip():
+            ocr_res = VisionMatcher.find_text_with_ocr(
+                screen_img=screen_img,
+                target_text=element_text,
+                expected_x=expected_x,
+                expected_y=expected_y,
+                search_radius=search_vicinity_radius
+            )
+            if ocr_res:
+                return ocr_res
+
+        # === ШАР 3b: Багатомасштабний OpenCV matchTemplate на краях ===
+        if template_b64 or template_bank:
+            cv_res = VisionMatcher._find_with_opencv_multiscale(
+                template_b64=template_b64,
+                expected_x=expected_x,
+                expected_y=expected_y,
+                offset_x=offset_x,
+                offset_y=offset_y,
+                confidence=confidence,
+                search_vicinity_radius=search_vicinity_radius,
+                screen_img=screen_img,
+                template_bank=template_bank,
+            )
+            if cv_res:
+                return cv_res
+
+        # === ШАР 3c: Gemini Vision API (останній резервний шар) ===
         if use_gemini and HAS_GEMINI and is_gemini_available():
             bank = template_bank or ([template_b64] if template_b64 else [])
             if bank or element_text:
-                result = find_element_with_gemini(
+                gemini_res = find_element_with_gemini(
                     screen_img=screen_img,
                     template_bank=bank,
                     expected_x=expected_x,
@@ -168,21 +379,10 @@ class VisionMatcher:
                     element_text=element_text,
                     target_type=target_type,
                 )
-                if result:
-                    return result
+                if gemini_res:
+                    return gemini_res
 
-        # === СТРАТЕГІЯ 2: OpenCV matchTemplate (fallback) ===
-        return VisionMatcher._find_with_opencv(
-            template_b64=template_b64,
-            expected_x=expected_x,
-            expected_y=expected_y,
-            offset_x=offset_x,
-            offset_y=offset_y,
-            confidence=confidence,
-            search_vicinity_radius=search_vicinity_radius,
-            screen_img=screen_img,
-            template_bank=template_bank,
-        )
+        return None
 
     @staticmethod
     def detect_files_in_area(
@@ -190,23 +390,58 @@ class VisionMatcher:
         area_rect: Optional[Tuple[int, int, int, int]] = None
     ) -> List[Dict[str, Any]]:
         """
-        Знаходить файли на екрані за допомогою Gemini Vision або евристичного детектора.
-        Повертає список: [{'name': '001_Документ.pdf', 'x': 450, 'y': 720}, ...]
+        Знаходить файли або рядки списку в зазначеній області:
+        1. Спроба через Windows UI Automation (зчитує справжні елементи ListItem / DataItem).
+        2. Спроба через локальний OCR (RapidOCR / winocr) для зчитування реального тексту рядків.
+        3. Спроба через Gemini Vision.
+        Повертає виключно реальні розпізнані елементи (без фіктивних евристик).
         """
+        # 1. UI Automation
+        if HAS_UIA:
+            items = UIAManager.get_list_items(area_rect=area_rect)
+            if items:
+                return items
+
         if screen_img is None:
             screen_img = VisionMatcher.capture_screen_image()
-
         if screen_img is None:
             return []
 
-        # 1. Спроба через Gemini Vision
+        # 2. Локальний OCR
+        sh, sw = screen_img.shape[:2]
+        crop_x1, crop_y1 = 0, 0
+        if area_rect:
+            x1, y1, x2, y2 = area_rect
+            crop_x1, crop_y1 = max(0, x1), max(0, y1)
+            crop_x2, crop_y2 = min(sw, x2), min(sh, y2)
+            crop_img = screen_img[crop_y1:crop_y2, crop_x1:crop_x2]
+        else:
+            crop_img = screen_img
+
+        if HAS_RAPID_OCR and _rapid_ocr is not None and crop_img.size > 0:
+            try:
+                results, _ = _rapid_ocr(crop_img)
+                if results:
+                    detected = []
+                    for box, text, score in results:
+                        txt = text.strip()
+                        if len(txt) > 2 and score > 0.5:
+                            pts = np.array(box)
+                            cx = int(np.mean(pts[:, 0])) + crop_x1
+                            cy = int(np.mean(pts[:, 1])) + crop_y1
+                            detected.append({"name": txt, "x": cx, "y": cy})
+                    if detected:
+                        return detected
+            except Exception as e:
+                logger.debug(f"OCR виявлення файлів: {e}")
+
+        # 3. Gemini Vision
         if HAS_GEMINI and is_gemini_available():
             files = detect_files_on_screen(screen_img, search_rect=area_rect)
             if files:
                 return files
 
-        # 2. Евристичний детектор рядків у списку (fallback без Gemini)
-        return VisionMatcher._detect_rows_heuristic(screen_img, area_rect)
+        return []
 
     @staticmethod
     def detect_files_with_priority(
@@ -216,17 +451,13 @@ class VisionMatcher:
         priority: str = "area_1_first"
     ) -> List[Dict[str, Any]]:
         """
-        Шукає файли за двома областями з урахуванням зазначеного пріоритету:
-        - 'area_1_first': Спочатку Область 1; якщо не знайдено — Область 2.
-        - 'area_2_first': Спочатку Область 2; якщо не знайдено — Область 1.
-        - 'both': Об'єднує файли з обох областей.
+        Шукає файли за двома областями з урахуванням зазначеного пріоритету.
         """
         if screen_img is None:
             screen_img = VisionMatcher.capture_screen_image()
         if screen_img is None:
             return []
 
-        # Якщо є тільки одна з областей
         if area_rect_1 and not area_rect_2:
             return VisionMatcher.detect_files_in_area(screen_img, area_rect_1)
         if area_rect_2 and not area_rect_1:
@@ -234,7 +465,6 @@ class VisionMatcher:
         if not area_rect_1 and not area_rect_2:
             return VisionMatcher.detect_files_in_area(screen_img, None)
 
-        # Обидві області вказані:
         if priority == "area_2_first":
             primary_rect, secondary_rect = area_rect_2, area_rect_1
         else:
@@ -243,7 +473,6 @@ class VisionMatcher:
         if priority == "both":
             f1 = VisionMatcher.detect_files_in_area(screen_img, area_rect_1)
             f2 = VisionMatcher.detect_files_in_area(screen_img, area_rect_2)
-            # Об'єднуємо унікальні за координатами
             seen = set()
             combined = []
             for item in f1 + f2:
@@ -253,131 +482,8 @@ class VisionMatcher:
                     combined.append(item)
             return combined
 
-        # Спочатку шукаємо в першочерговій області
         files = VisionMatcher.detect_files_in_area(screen_img, primary_rect)
         if files:
             return files
 
-        # Якщо в першій області не знайдено — шукаємо у вторинній
         return VisionMatcher.detect_files_in_area(screen_img, secondary_rect)
-
-
-    @staticmethod
-    def _detect_rows_heuristic(
-        screen_img: np.ndarray,
-        area_rect: Optional[Tuple[int, int, int, int]] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Евристично виявляє рядки файлів/документів у зазначеній області списку.
-        """
-        sh, sw = screen_img.shape[:2]
-        if area_rect:
-            x1, y1, x2, y2 = area_rect
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(sw, x2), min(sh, y2)
-        else:
-            x1, y1, x2, y2 = 50, 100, sw - 50, sh - 100
-
-        crop = screen_img[y1:y2, x1:x2]
-        if crop.size == 0:
-            return []
-
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        # Горизонтальні лінії/рядки
-        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        row_energy = np.mean(np.abs(sobel_y), axis=1)
-
-        # Знаходимо піки рядків із кроком ~20-35px (типова висота рядка в списках Windows)
-        row_height = 28
-        h_crop = y2 - y1
-        num_rows = max(1, h_crop // row_height)
-        
-        detected = []
-        center_x = x1 + (x2 - x1) // 3  # клік ближче до назви файлу зліва
-        
-        for i in range(min(num_rows, 15)):
-            r_y = y1 + (i * row_height) + (row_height // 2)
-            if r_y < y2 - 5:
-                detected.append({
-                    "name": f"Рядок/Файл #{i + 1} (Y={r_y})",
-                    "x": center_x,
-                    "y": r_y
-                })
-
-        return detected
-
-
-    @staticmethod
-    def _find_with_opencv(
-        template_b64: str,
-        expected_x: int,
-        expected_y: int,
-        offset_x: int,
-        offset_y: int,
-        confidence: float = 0.75,
-        search_vicinity_radius: int = 350,
-        screen_img: Optional[np.ndarray] = None,
-        template_bank: Optional[List[str]] = None,
-    ) -> Optional[Tuple[int, int, float]]:
-        """
-        OpenCV matchTemplate пошук.
-        При наявності template_bank — пробує кожен шаблон з банку (кращий виграє).
-        """
-        if screen_img is None:
-            return None
-
-        # Збираємо усі шаблони для перевірки (банк + основний)
-        candidates = list(template_bank) if template_bank else []
-        if template_b64 and template_b64 not in candidates:
-            candidates.insert(0, template_b64)
-
-        if not candidates:
-            return None
-
-        s_h, s_w = screen_img.shape[:2]
-        screen_gray = cv2.cvtColor(screen_img, cv2.COLOR_BGR2GRAY)
-
-        best_result = None
-        best_score = 0.0
-
-        for tmpl_b64 in candidates:
-            template = VisionMatcher.b64_to_image(tmpl_b64)
-            if template is None:
-                continue
-
-            t_h, t_w = template.shape[:2]
-            if s_h < t_h or s_w < t_w:
-                continue
-
-            template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
-
-            # ЕТАП 1: Пошук в зоні очікуваних координат (швидкий)
-            if search_vicinity_radius > 0:
-                vx1 = max(0, expected_x - search_vicinity_radius)
-                vy1 = max(0, expected_y - search_vicinity_radius)
-                vx2 = min(s_w, expected_x + search_vicinity_radius)
-                vy2 = min(s_h, expected_y + search_vicinity_radius)
-
-                if (vx2 - vx1) >= t_w and (vy2 - vy1) >= t_h:
-                    vicinity_crop = screen_gray[vy1:vy2, vx1:vx2]
-                    res = cv2.matchTemplate(vicinity_crop, template_gray, cv2.TM_CCOEFF_NORMED)
-                    _, max_v, _, max_l = cv2.minMaxLoc(res)
-
-                    if max_v > best_score:
-                        best_score = max_v
-                        found_x = vx1 + max_l[0]
-                        found_y = vy1 + max_l[1]
-                        best_result = (found_x + offset_x, found_y + offset_y, max_v)
-
-            # ЕТАП 2: Глобальний пошук по всьому екрану
-            res_global = cv2.matchTemplate(screen_gray, template_gray, cv2.TM_CCOEFF_NORMED)
-            _, max_v, _, max_l = cv2.minMaxLoc(res_global)
-
-            if max_v > best_score:
-                best_score = max_v
-                best_result = (max_l[0] + offset_x, max_l[1] + offset_y, max_v)
-
-        if best_result and best_score >= confidence:
-            return best_result
-
-        return None

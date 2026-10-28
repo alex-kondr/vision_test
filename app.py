@@ -560,32 +560,42 @@ class AutoFlowApp(ctk.CTk):
                 desc = f"Пошук файлів на екрані{elem_info} [{mode_str}]{areas_str}{prio_str}"
                 vision_badge = "🤖 Файли"
                 tag = "file"
+            elif action.type == "print_file":
+                type_str = "🖨️ Прямий друк"
+                fname = os.path.basename(action.print_file_path) if action.print_file_path else "файл"
+                desc = f"Друк \"{fname}\" ➔ [{action.printer_name or 'типовий принтер'}]"
+                vision_badge = "Системний"
+                tag = "file"
             elif action.type == "menu_click" or getattr(action, "target_type", "") == "menu_item":
                 type_str = "📋 Пункт меню"
-                name_str = f" \"{action.element_text}\"" if action.element_text else ""
+                name_str = f" \"{action.element_text or action.uia_name}\"" if (action.element_text or action.uia_name) else ""
                 desc = f"Пункт меню{name_str} на ({action.x}, {action.y})"
                 if action.comment:
                     desc += f"  [{action.comment}]"
-                if action.template_b64 and getattr(action, "use_vision", True):
+                if action.uia_name:
+                    vision_badge = f"⚡ UIA: {action.uia_control_type or 'MenuItem'}"
+                elif action.template_b64 and getattr(action, "use_vision", True):
                     bank = getattr(action, "template_bank", [])
                     bank_count = len(bank) if bank else 1
-                    vision_badge = f"🤖 Меню [x{bank_count}]"
+                    vision_badge = f"🎯 Зір [x{bank_count}]"
                 else:
-                    vision_badge = "Семантика"
+                    vision_badge = "🔍 OCR" if action.element_text else "Координати"
                 tag = "menu"
             elif "click" in action.type:
                 is_right = ("right" in action.type or action.button == "right")
-                text_part = f" \"{action.element_text}\"" if action.element_text else ""
+                text_part = f" \"{action.element_text or action.uia_name}\"" if (action.element_text or action.uia_name) else ""
                 type_str = "🖱️ Контекстне меню" if is_right else ("🖱️🖱️ Подвійний" if "double" in action.type else f"🔘 Клік{text_part}")
                 desc = f"Базові: ({action.x}, {action.y})"
                 if action.comment:
                     desc += f"  [{action.comment}]"
-                if action.template_b64 and getattr(action, "use_vision", True):
+                if action.uia_name:
+                    vision_badge = f"⚡ UIA: {action.uia_control_type or 'Button'}"
+                elif action.template_b64 and getattr(action, "use_vision", True):
                     bank = getattr(action, "template_bank", [])
                     bank_count = len(bank) if bank else 1
-                    vision_badge = f"🤖🎯 {action.template_width}x{action.template_height} [x{bank_count}]"
-                elif action.template_b64:
-                    vision_badge = "Вимкнено"
+                    vision_badge = f"🎯 Зір [x{bank_count}]"
+                elif action.element_text:
+                    vision_badge = "🔍 OCR"
                 else:
                     vision_badge = "Тільки координати"
                 tag = "click"
@@ -956,13 +966,13 @@ class AutoFlowApp(ctk.CTk):
             self.lbl_progress_text.configure(
                 text=f"Обробка листа {cycle} з {total_cycles}..."
             )
-            progress = (cycle - 1) / total_cycles
+            progress = max(0.0, min(1.0, (cycle - 1) / max(1, total_cycles)))
             self.progress_bar.set(progress)
         self.after(0, update)
 
     def _on_player_cycle_end(self, cycle: int, total_cycles: int):
         def update():
-            progress = cycle / total_cycles
+            progress = max(0.0, min(1.0, cycle / max(1, total_cycles)))
             self.progress_bar.set(progress)
         self.after(0, update)
 
@@ -977,7 +987,8 @@ class AutoFlowApp(ctk.CTk):
             item_id = str(step_idx)
             if self.tree.exists(item_id):
                 tags = list(self.tree.item(item_id, "tags"))
-                tags.append("running")
+                if "running" not in tags:
+                    tags.append("running")
                 self.tree.item(item_id, tags=tags)
                 self.tree.see(item_id)
 
@@ -1071,9 +1082,14 @@ class AutoFlowApp(ctk.CTk):
     # ==========================================================
     def open_add_action_dialog(self):
         """Відкриває діалог додавання та повного налаштування нової дії."""
+        if self.player.is_running:
+            messagebox.showwarning("Виконання активне", "Не можна змінювати сценарій під час його відтворення.", parent=self)
+            return
         AddActionDialog(self, on_save=self._on_action_added)
 
     def _on_action_added(self, new_action: WorkflowAction):
+        if self.player.is_running:
+            return
         selected = self.tree.selection()
         if selected:
             idx = int(selected[0]) + 1
@@ -1088,6 +1104,9 @@ class AutoFlowApp(ctk.CTk):
 
     def add_start_sequence_dialog(self):
         """Додає початковий ланцюжок дій: Клік по області -> Прокрутка до низу -> Вибір файлу."""
+        if self.player.is_running:
+            messagebox.showwarning("Виконання активне", "Не можна змінювати сценарій під час його відтворення.", parent=self)
+            return
         default_x = 500
         default_y = 400
         for a in self.workflow.actions:
@@ -1140,9 +1159,11 @@ class AutoFlowApp(ctk.CTk):
         )
 
     def add_manual_checkpoint(self):
+        if self.player.is_running:
+            messagebox.showwarning("Виконання активне", "Не можна змінювати сценарій під час його відтворення.", parent=self)
+            return
         action = WorkflowAction(
             type="checkpoint",
-
             delay_before=0.5,
             title="Точка перевірки",
             message="Перевірте стан та натисніть 'Продовжити'"
@@ -1158,6 +1179,9 @@ class AutoFlowApp(ctk.CTk):
         self._refresh_table()
 
     def edit_selected_action(self):
+        if self.player.is_running:
+            messagebox.showwarning("Виконання активне", "Не можна редагувати кроки під час відтворення.", parent=self)
+            return
         selected = self.tree.selection()
         if not selected:
             return
@@ -1171,6 +1195,9 @@ class AutoFlowApp(ctk.CTk):
         EditActionDialog(self, action, on_saved)
 
     def delete_selected_action(self):
+        if self.player.is_running:
+            messagebox.showwarning("Виконання активне", "Не можна видаляти кроки під час відтворення.", parent=self)
+            return
         selected = self.tree.selection()
         if not selected:
             return
@@ -1179,6 +1206,8 @@ class AutoFlowApp(ctk.CTk):
         self._refresh_table()
 
     def _move_action(self, delta: int):
+        if self.player.is_running:
+            return
         selected = self.tree.selection()
         if not selected:
             return
@@ -1193,6 +1222,9 @@ class AutoFlowApp(ctk.CTk):
             self.tree.selection_set(str(new_idx))
 
     def clear_actions(self):
+        if self.player.is_running:
+            messagebox.showwarning("Виконання активне", "Не можна очищувати сценарій під час відтворення.", parent=self)
+            return
         if not self.workflow.actions:
             return
         if messagebox.askyesno("Очистити", "Ви дійсно бажаєте очистити всі кроки сценарію?", parent=self):
@@ -1211,7 +1243,7 @@ class AutoFlowApp(ctk.CTk):
             defaultextension=".json",
             filetypes=[("Файли сценаріїв (*.json)", "*.json"), ("Усі файли", "*.*")],
             title="Зберегти сценарій",
-            initialfile="поштовий_сценарій.json",
+            initialfile="mail_workflow.json",
             parent=self
         )
         if file_path:

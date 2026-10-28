@@ -1,16 +1,34 @@
 """
-Модуль відтворення сценаріїв автоматизації з підтримкою комп'ютерного зору (Smart Vision),
-пауз, точок схвалення та циклів.
+Модуль відтворення сценаріїв автоматизації (ActionPlayer).
+
+Реалізує 3-шарову гібридну архітектуру:
+  - Шар 1. Windows UI Automation (pywinauto / uiautomation) — знаходить кнопки, меню та рядки
+    за назвою та типом елемента, незалежно від зміщення вікна (15–25% чи більше).
+  - Шар 2. Клавіатура (Ctrl+P, Alt+..., Tab, Enter, стрілки, навігація).
+  - Шар 3. Комп'ютерний зір (Швидкий OCR -> багатомасштабний контурний OpenCV -> Gemini Vision як резерв).
+
+Також підтримує:
+  - Прямий друк файлів (PDF) без кліків у системних діалогах
+  - Захист списку дій від модифікацій під час виконання
+  - Автоматичний журнал помилок зі збереженням скріншота екрана при збоях
+  - Точки схвалення (F8), паузи, цикли та екстрену зупинку (Esc).
 """
+import os
 import time
 import threading
+import logging
 from typing import List, Callable, Optional, Dict, Any, Tuple
 import pyautogui
 import pynput
-from models import WorkflowAction, Workflow
-from vision_matcher import VisionMatcher
+import cv2
 import winsound
 import pyperclip
+
+from models import WorkflowAction, Workflow
+from vision_matcher import VisionMatcher
+from uia_manager import UIAManager
+
+logger = logging.getLogger("ActionPlayer")
 
 try:
     from gemini_vision import is_gemini_available
@@ -20,6 +38,7 @@ except ImportError:
 # Безпечна екстрена зупинка
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.02
+
 
 class ActionPlayer:
     def __init__(self):
@@ -31,6 +50,8 @@ class ActionPlayer:
         self.current_cycle = 0
         self.total_cycles = 1
         self.current_step = 0
+        self.speed_factor = 1.0
+        self.pause_between_cycles = True
         
         # Подія для очікування відповіді користувача в точці схвалення
         self._checkpoint_event = threading.Event()
@@ -90,10 +111,8 @@ class ActionPlayer:
         self._checkpoint_event.set()
 
     def resume_from_file_menu(self, file_dict: Optional[dict]):
-        """Отримує обраний файл із контекстного меню та продовжує роботу."""
         self._selected_file_result = file_dict
         self._file_menu_event.set()
-
 
     def _start_esc_listener(self):
         def on_press(key):
@@ -111,6 +130,29 @@ class ActionPlayer:
                 pass
             self._esc_listener = None
 
+    def _save_error_log_and_screenshot(self, error_msg: str, step_idx: int, action: Optional[WorkflowAction]):
+        """Створює знімок екрана та записує помилку у файл журналу logs/execution.log."""
+        try:
+            os.makedirs("logs/errors", exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            shot_path = os.path.abspath(f"logs/errors/error_{ts}.png")
+            log_path = os.path.abspath("logs/execution.log")
+
+            screen = VisionMatcher.capture_screen_image()
+            if screen is not None:
+                cv2.imwrite(shot_path, screen)
+
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ПОМИЛКА: {error_msg}\n")
+                f.write(f"  Цикл: {self.current_cycle}/{self.total_cycles}, Крок: {step_idx + 1}\n")
+                if action:
+                    f.write(f"  Дія: {action.type}, Текст: '{action.element_text}', UIA: '{action.uia_name}'\n")
+                    f.write(f"  Локатор UIA: window='{action.uia_window}', type='{action.uia_control_type}', id='{action.uia_automation_id}'\n")
+                f.write(f"  Скріншот екрана: {shot_path}\n")
+                f.write("-" * 60 + "\n")
+        except Exception as ex:
+            logger.error(f"Не вдалося зберегти журнал помилки: {ex}")
+
     def _run_loop(self):
         success = True
         message = "Сценарій успішно виконано!"
@@ -124,7 +166,6 @@ class ActionPlayer:
                 if self.on_cycle_start:
                     self.on_cycle_start(cycle, self.total_cycles)
                     
-                # Якщо це новий цикл (починаючи з 2-го) і ввімкнено очікування вибору наступного листа
                 if cycle > 1 and self.pause_between_cycles:
                     pause_action = WorkflowAction(
                         type="checkpoint",
@@ -134,7 +175,8 @@ class ActionPlayer:
                     if not self._handle_checkpoint(pause_action, 0, len(self.workflow.actions)):
                         break
 
-                actions = self.workflow.actions
+                # Захисна копія списку дій для поточної ітерації циклу
+                actions = list(self.workflow.actions)
                 total_steps = len(actions)
                 
                 for idx, action in enumerate(actions):
@@ -150,7 +192,11 @@ class ActionPlayer:
                             self.abort_requested = True
                             break
                     else:
-                        self._execute_action(action)
+                        try:
+                            self._execute_action(action)
+                        except Exception as step_err:
+                            self._save_error_log_and_screenshot(str(step_err), idx, action)
+                            raise step_err
                         
                 if self.abort_requested:
                     break
@@ -165,7 +211,7 @@ class ActionPlayer:
 
         except Exception as e:
             success = False
-            message = f"Помилка виконання: {str(e)}"
+            message = f"Помилка виконання на кроці {self.current_step}: {str(e)}"
         finally:
             self.is_running = False
             self._stop_esc_listener()
@@ -198,25 +244,48 @@ class ActionPlayer:
 
     def _resolve_click_coordinates(self, action: WorkflowAction) -> Tuple[int, int]:
         """
-        Визначає реальні координати кліку:
-        1. Для кліку по області (area_click): використовує координати зони фокусування.
-        2. Для конкретного елемента / кнопки / пункту меню:
-           a. Gemini Vision API (якщо доступний) — аналізує весь банк шаблонів, семантичний текст
-              ('Додаткові дії') та знаходить елемент навіть при зміщенні на 10-25%.
-           b. OpenCV matchTemplate — fallback у радіусі 500px або по всьому екрану.
-        3. Якщо нічого не знайдено — використовує базові координати (action.x, action.y).
+        3-шарове визначення координат кліку:
+        Шар 1: UI Automation (pywinauto / uiautomation) — за назвою, типом та AutomationId.
+        Шар 2: Швидкий локальний OCR (RapidOCR / winocr) за назвою/текстом елемента.
+        Шар 3: Багатомасштабний контурний OpenCV matchTemplate + Gemini Vision (якщо увімкнено).
+        Fallback: базові координати (action.x, action.y).
         """
         target_x = action.x or 0
         target_y = action.y or 0
 
-        # Клік по області — не потребує піксельного шаблону, клікає для фокусу списку/панелі
+        # Клік по області — клікає у центр зони для фокусування
         if action.type == "area_click" or getattr(action, "target_type", "") == "area":
             return target_x, target_y
 
-        elem_text = getattr(action, "element_text", "") or ""
-        target_type = getattr(action, "target_type", "element") or "element"
+        elem_text = getattr(action, "element_text", "") or getattr(action, "uia_name", "") or ""
 
-        # Перевірка чи використовується комп'ютерний зір
+        # === ШАР 1: Windows UI Automation ===
+        has_uia_locator = bool(
+            getattr(action, "uia_name", "")
+            or getattr(action, "uia_automation_id", "")
+            or getattr(action, "uia_control_type", "")
+            or elem_text
+        )
+
+        if UIAManager.is_available() and has_uia_locator:
+            locator = {
+                "name": action.uia_name or elem_text,
+                "control_type": action.uia_control_type,
+                "window_title": action.uia_window,
+                "automation_id": action.uia_automation_id,
+            }
+            if self.on_vision_status:
+                lbl = action.uia_name or elem_text or action.uia_control_type or "елемент"
+                self.on_vision_status(f"⚡ UIA: пошук елемента \"{lbl}\"...")
+
+            uia_coords = UIAManager.find_element(locator, timeout=0.8)
+            if uia_coords:
+                ux, uy = uia_coords
+                if self.on_vision_status:
+                    self.on_vision_status(f"✅ UIA знайшов \"{locator['name']}\" на ({ux}, {uy})")
+                return ux, uy
+
+        # === ШАР 3: Комп'ютерний зір (OCR -> OpenCV Multi-scale -> Gemini) ===
         use_vision = (
             getattr(self.workflow, "use_smart_vision", True)
             and getattr(action, "use_vision", True)
@@ -224,64 +293,101 @@ class ActionPlayer:
         )
 
         if use_vision:
-            confidence = getattr(action, "confidence", 0.75) or 0.75
+            confidence = getattr(action, "confidence", 0.70) or 0.70
             offset_x = action.template_offset_x or (action.template_width // 2 if action.template_width else 0)
             offset_y = action.template_offset_y or (action.template_height // 2 if action.template_height else 0)
-
-            # Банк шаблонів з усіх попередніх сеансів навчання
             bank = getattr(action, "template_bank", []) or []
-
-            # Текстова підказка для Gemini Vision (коментар кроку)
             hint = getattr(action, "comment", "") or ""
+            target_type = getattr(action, "target_type", "element") or "element"
 
-            # Повідомляємо про режим пошуку
             gemini_on = is_gemini_available()
             if self.on_vision_status:
-                bank_info = f" [банк: {len(bank)} знімків]" if bank else ""
                 name_info = f" \"{elem_text}\"" if elem_text else ""
-                mode_str = "Gemini Vision" if gemini_on else "OpenCV"
-                self.on_vision_status(f"🔍 {mode_str}: пошук елемента{name_info}{bank_info}...")
+                self.on_vision_status(f"🔍 Комп'ютерний зір: пошук{name_info} (OCR / OpenCV)...")
 
-            # Робимо до 2 спроб із невеликою затримкою
-            found = None
-            for attempt in range(2):
-                if self.abort_requested:
-                    break
-                found = VisionMatcher.find_element_on_screen(
-                    template_b64=action.template_b64 or "",
-                    expected_x=target_x,
-                    expected_y=target_y,
-                    offset_x=offset_x,
-                    offset_y=offset_y,
-                    confidence=confidence,
-                    search_vicinity_radius=500,
-                    template_bank=bank,
-                    element_hint=hint,
-                    element_text=elem_text,
-                    target_type=target_type,
-                    use_gemini=gemini_on,
-                )
-                if found:
-                    break
-                time.sleep(0.15)
+            found = VisionMatcher.find_element_on_screen(
+                template_b64=action.template_b64 or "",
+                expected_x=target_x,
+                expected_y=target_y,
+                offset_x=offset_x,
+                offset_y=offset_y,
+                confidence=confidence,
+                search_vicinity_radius=500,
+                template_bank=bank,
+                element_hint=hint,
+                element_text=elem_text,
+                target_type=target_type,
+                use_gemini=gemini_on,
+            )
 
             if found:
                 actual_x, actual_y, score = found
                 if actual_x != target_x or actual_y != target_y:
-                    mode = "🤖 Gemini" if gemini_on else "🎯 OpenCV"
                     label = f" \"{elem_text}\"" if elem_text else ""
-                    msg = f"{mode} знайшов{label} зі зміщенням: ({target_x}, {target_y}) ➔ ({actual_x}, {actual_y}) [Точність: {int(score*100)}%]"
+                    msg = f"🎯 Знайдено{label} зі зміщенням: ({target_x}, {target_y}) ➔ ({actual_x}, {actual_y}) [{int(score*100)}%]"
                     if self.on_vision_status:
                         self.on_vision_status(msg)
                 else:
                     if self.on_vision_status:
-                        self.on_vision_status(f"✅ Елемент знайдено на ({actual_x}, {actual_y}) [Точність: {int(score*100)}%]")
+                        self.on_vision_status(f"✅ Елемент знайдено на ({actual_x}, {actual_y}) [{int(score*100)}%]")
                 return actual_x, actual_y
             else:
                 if self.on_vision_status:
-                    self.on_vision_status(f"⚠️ Елемент не знайдено, використовуються базові ({target_x}, {target_y})")
+                    self.on_vision_status(f"⚠️ Елемент не знайдено зором, використовуються базові ({target_x}, {target_y})")
 
         return target_x, target_y
+
+    def _execute_print_file(self, action: WorkflowAction):
+        """Прямий друк файлу (PDF) без виклику діалогових вікон."""
+        path = action.print_file_path or ""
+        if not path or not os.path.exists(path):
+            if self.on_vision_status:
+                self.on_vision_status(f"⚠️ Файл для друку не знайдено: {path}")
+            return
+
+        printer = action.printer_name or ""
+        settings = action.print_settings or ""
+
+        if self.on_vision_status:
+            self.on_vision_status(f"🖨️ Прямий друк: '{os.path.basename(path)}' на {printer or 'типовий принтер'}...")
+
+        # 1. Спроба через SumatraPDF (найстабільніший для PDF)
+        sumatra_paths = [
+            "SumatraPDF.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\SumatraPDF\SumatraPDF.exe"),
+            r"C:\Program Files\SumatraPDF\SumatraPDF.exe",
+            r"C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe",
+        ]
+        sumatra_exe = None
+        for p in sumatra_paths:
+            if os.path.exists(p):
+                sumatra_exe = p
+                break
+
+        if sumatra_exe:
+            import subprocess
+            cmd = [sumatra_exe, "-print-to", printer] if printer else [sumatra_exe, "-print-to-default"]
+            if settings:
+                cmd.extend(["-print-settings", settings])
+            cmd.append(path)
+            try:
+                subprocess.run(cmd, check=True, timeout=15)
+                time.sleep(1.0)
+                return
+            except Exception as e:
+                logger.warning(f"Помилка SumatraPDF: {e}")
+
+        # 2. Системний друк Windows Shell
+        try:
+            import win32api
+            win32api.ShellExecute(0, "print", path, f'/d:"{printer}"' if printer else None, ".", 0)
+            time.sleep(1.5)
+        except Exception:
+            try:
+                os.startfile(path, "print")
+                time.sleep(1.5)
+            except Exception as ex:
+                logger.error(f"Не вдалося виконати друк файлу: {ex}")
 
     def _execute_action(self, action: WorkflowAction):
         """Виконує одиничну дію миші або клавіатури з урахуванням затримки."""
@@ -297,43 +403,28 @@ class ActionPlayer:
         if self.abort_requested:
             return
 
-        # 1. Прокрутка списку виключно вниз (по осі X не рухаємо) – спрощена реалізація
-        if action.type == "scroll_to_bottom" or getattr(action, "scroll_to_bottom", False):
-            if self.on_vision_status:
-                self.on_vision_status("📜 Вертикальна прокрутка списку вниз (вісь X зафіксована)...")
-            # Прокручування коліщатком вниз
-            for _ in range(10):
-                if self.abort_requested:
-                    break
-                pyautogui.scroll(-500)
-                time.sleep(0.02)
-            # Додаткові натискання PageDown для гарантованого переходу до кінця
-            try:
-                for _ in range(2):
-                    pyautogui.press("pagedown")
-                    time.sleep(0.05)
-            except Exception:
-                pass
-            time.sleep(0.15)
+        # 1. Прямий системний друк файлу
+        if action.type == "print_file":
+            self._execute_print_file(action)
             return
 
-        # 2. Вибір файлу зі списку на екрані (з відображенням контекстного меню або авто)
+        # 2. Прокрутка списку до кінця (через UIA / End)
+        if action.type == "scroll_to_bottom" or getattr(action, "scroll_to_bottom", False):
+            if self.on_vision_status:
+                self.on_vision_status("📜 Прокрутка списку до самого кінця (End / UIA)...")
+            UIAManager.scroll_to_bottom(window_title=action.uia_window or "", x=action.x, y=action.y)
+            time.sleep(0.2)
+            return
+
+        # 3. Вибір файлу зі списку на екрані
         if action.type == "file_selection" or getattr(action, "show_file_menu", False):
             rect1 = getattr(action, "area_rect_1", None)
             rect2 = getattr(action, "area_rect_2", None)
             priority = getattr(action, "search_priority", "area_1_first")
             
-            area_desc = ""
-            if rect1 and rect2:
-                pr_text = "Область 1 ➔ 2" if priority == "area_1_first" else ("Область 2 ➔ 1" if priority == "area_2_first" else "Область 1 + 2")
-                area_desc = f" (за 2 областями, {pr_text})"
-            elif rect1:
-                area_desc = f" (в Області 1: {rect1})"
-
             if self.on_vision_status:
-                self.on_vision_status(f"🔍 Сканування екрана: пошук списку файлів{area_desc}...")
+                self.on_vision_status("🔍 Сканування списку файлів (UIA / OCR)...")
 
-            # Шукаємо файли на екрані за двома областями з урахуванням пріоритету
             files = VisionMatcher.detect_files_with_priority(
                 area_rect_1=rect1,
                 area_rect_2=rect2,
@@ -355,27 +446,25 @@ class ActionPlayer:
                     cy = chosen["y"]
                     fname = chosen.get("name", "файл")
                     if self.on_vision_status:
-                        self.on_vision_status(f"📄 Вибрано файл: {fname} на ({cx}, {cy})")
+                        self.on_vision_status(f"📄 Вибрано файл: '{fname}' на ({cx}, {cy})")
                     pyautogui.click(x=cx, y=cy)
                     time.sleep(0.15)
             else:
-                # Автоматичний вибір: клікаємо на останній файл у списку (найнижчий)
                 if files:
                     bottom_file = max(files, key=lambda f: f.get("y", 0))
                     cx = bottom_file["x"]
                     cy = bottom_file["y"]
                     fname = bottom_file.get("name", "файл")
                     if self.on_vision_status:
-                        self.on_vision_status(f"📄 Авто-вибір останнього файлу: {fname} на ({cx}, {cy})")
+                        self.on_vision_status(f"📄 Авто-вибір останнього рядка/файлу: '{fname}' на ({cx}, {cy})")
                     pyautogui.click(x=cx, y=cy)
                 elif action.x and action.y:
                     pyautogui.click(x=action.x, y=action.y)
                 time.sleep(0.15)
             return
 
-        # 3. Кліки (по області, кнопці, подвійний або контекстне меню)
+        # 4. Кліки (по області, кнопці, подвійний або контекстне меню)
         if action.type in ("click", "double_click", "right_click", "area_click", "menu_click"):
-            # Клік по області (фокусування вікна списку)
             if action.type == "area_click" or getattr(action, "target_type", "") == "area":
                 rect1 = getattr(action, "area_rect_1", None)
                 if rect1:
@@ -390,18 +479,16 @@ class ActionPlayer:
                 time.sleep(0.15)
                 return
 
-
-            # Визначаємо актуальні координати (зі Smart Vision або базові)
             click_x, click_y = self._resolve_click_coordinates(action)
 
-            # Захист від нульових координат — запобігаємо PyAutoGUI fail-safe (кут 0,0)
+            # Захист fail-safe
             if click_x <= 5 and click_y <= 5:
                 if self.on_vision_status:
-                    self.on_vision_status(f"⚠️ Пропуск кліку: координати ({click_x}, {click_y}) занадто близько до кута екрана (fail-safe захист)")
+                    self.on_vision_status(f"⚠️ Пропуск кліку: координати ({click_x}, {click_y}) в куті екрана")
                 return
 
+            btn = action.button if action.button in ("left", "right", "middle") else "left"
             if action.type in ("click", "menu_click"):
-                btn = action.button if action.button in ("left", "right", "middle") else "left"
                 pyautogui.click(x=click_x, y=click_y, button=btn)
             elif action.type == "double_click":
                 pyautogui.doubleClick(x=click_x, y=click_y)
@@ -409,11 +496,13 @@ class ActionPlayer:
                 pyautogui.rightClick(x=click_x, y=click_y)
                 time.sleep(0.1)
 
+            # Перевірка після кліку: коротка пауза для реакції інтерфейсу
+            time.sleep(0.08)
+
         elif action.type == "key_press":
             self._type_key(action.key)
         elif action.type == "delay":
             pass
-
 
     def _type_key(self, key_str: Optional[str]):
         if not key_str:
@@ -436,6 +525,10 @@ class ActionPlayer:
             "shift_r": "shiftright",
             "alt_l": "altleft",
             "alt_r": "altright",
+            "end": "end",
+            "home": "home",
+            "pageup": "pageup",
+            "pagedown": "pagedown",
         }
         
         mapped = key_map.get(key_str.lower())

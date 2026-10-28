@@ -10,6 +10,7 @@ from typing import List, Callable, Optional, Tuple, Any
 from pynput import mouse, keyboard
 from models import WorkflowAction, Workflow
 from vision_matcher import VisionMatcher
+from uia_manager import UIAManager
 import winsound
 
 try:
@@ -261,8 +262,19 @@ class ActionRecorder:
             delay = 0.3
             is_right_click = (btn_str == "right")
             
+            # Шар 1: Windows UI Automation — зчитуємо семантичний локатор елемента під курсором
+            uia_info = UIAManager.get_element_at_point(x, y) if UIAManager.is_available() else {}
+            uia_name = (uia_info.get("name") or "").strip()
+            uia_control_type = (uia_info.get("control_type") or "").strip()
+            uia_window = (uia_info.get("window_title") or "").strip()
+            uia_auto_id = (uia_info.get("automation_id") or "").strip()
+            uia_cls = (uia_info.get("class_name") or "").strip()
+
             # Визначаємо тип цілі кліку (елемент / область / пункт меню)
             target_type = self.current_target_type
+            if uia_control_type.lower() in ("menuitem", "menu"):
+                target_type = "menu_item"
+
             is_area_click = (target_type == "area")
             is_menu_click = (target_type == "menu_item" or is_right_click)
 
@@ -270,9 +282,9 @@ class ActionRecorder:
             if not is_area_click:
                 crop_data = self._capture_vision_template(x, y, is_menu=is_menu_click)
 
-            # Автоматичне вилучення тексту кнопки чи пункту меню через Gemini (якщо активний)
-            extracted_text = ""
-            if crop_data and HAS_GEMINI_OCR and is_gemini_available():
+            extracted_text = uia_name
+            # Fallback: OCR тексту кнопки чи пункту меню
+            if not extracted_text and crop_data and HAS_GEMINI_OCR and is_gemini_available():
                 tmpl_img = VisionMatcher.b64_to_image(crop_data["template_b64"])
                 if tmpl_img is not None:
                     extracted_text = extract_element_text_from_crop(tmpl_img)
@@ -280,14 +292,15 @@ class ActionRecorder:
             if is_area_click:
                 action_type = "area_click"
                 comment_text = "Клік по області (фокус списку)"
-                # Скидаємо режим назад до звичайного елемента після одного кліку по області
                 self.set_target_type("element")
             elif is_menu_click:
                 action_type = "menu_click" if target_type == "menu_item" else ("right_click" if is_right_click else "click")
-                comment_text = f"Пункт меню: {extracted_text}" if extracted_text else "Вибір пункту меню"
+                item_label = extracted_text or uia_name or "пункт меню"
+                comment_text = f"Пункт меню: '{item_label}'"
             else:
                 action_type = "click"
-                comment_text = f"Кнопка: {extracted_text}" if extracted_text else "Клік по елементу"
+                btn_label = extracted_text or uia_name or (f"{uia_control_type}" if uia_control_type else "елемент")
+                comment_text = f"Клік: '{btn_label}'"
 
             if press_data:
                 px, py, ptime = press_data
@@ -299,6 +312,11 @@ class ActionRecorder:
                         type=action_type,
                         target_type=target_type,
                         element_text=extracted_text,
+                        uia_window=uia_window,
+                        uia_control_type=uia_control_type,
+                        uia_name=uia_name,
+                        uia_automation_id=uia_auto_id,
+                        uia_class_name=uia_cls,
                         delay_before=delay,
                         x=x,
                         y=y,
@@ -322,6 +340,11 @@ class ActionRecorder:
                 type=action_type,
                 target_type=target_type,
                 element_text=extracted_text,
+                uia_window=uia_window,
+                uia_control_type=uia_control_type,
+                uia_name=uia_name,
+                uia_automation_id=uia_auto_id,
+                uia_class_name=uia_cls,
                 delay_before=delay,
                 x=x,
                 y=y,

@@ -20,6 +20,12 @@ except ImportError:
     def extract_element_text_from_crop(*args, **kwargs): return ""
     def is_gemini_available(): return False
 
+try:
+    from uia_manager import UIAManager
+    HAS_UIA = True
+except ImportError:
+    HAS_UIA = False
+
 
 class CheckpointModalDialog(ctk.CTkToplevel):
     def __init__(
@@ -651,13 +657,27 @@ class ActionConfigDialog(ctk.CTkToplevel):
                     self.action.x = cx
                     self.action.y = cy
                     
-                    self.lbl_elem_status.configure(
-                        text=f"✅ Знімок захоплено ({w}x{h} px) на ({cx}, {cy})",
-                        text_color="#10b981"
-                    )
+                    # Спроба зчитати UIA елемент під центром виділення
+                    uia_found_name = ""
+                    if HAS_UIA:
+                        uia_info = UIAManager.get_element_at_point(cx, cy)
+                        if uia_info.get("name"):
+                            uia_found_name = uia_info["name"]
+                            self.action.uia_name = uia_found_name
+                            self.action.uia_control_type = uia_info.get("control_type", "")
+                            self.action.uia_window = uia_info.get("window_title", "")
+                            self.action.uia_automation_id = uia_info.get("automation_id", "")
+                            self.action.uia_class_name = uia_info.get("class_name", "")
+                            if hasattr(self, "entry_element_text"):
+                                self.entry_element_text.delete(0, "end")
+                                self.entry_element_text.insert(0, uia_found_name)
 
-                    # Фонове авторозпізнавання тексту через Gemini Vision (без зависання інтерфейсу)
-                    if HAS_GEMINI_OCR and is_gemini_available():
+                    if uia_found_name:
+                        self.lbl_elem_status.configure(
+                            text=f"⚡ UIA знайдено: \"{uia_found_name}\" ({self.action.uia_control_type})",
+                            text_color="#38bdf8"
+                        )
+                    elif HAS_GEMINI_OCR and is_gemini_available():
                         self.lbl_elem_status.configure(
                             text=f"✅ Знімок ({w}x{h} px) | 🤖 Розпізнавання тексту елемента...",
                             text_color="#38bdf8"
@@ -682,6 +702,11 @@ class ActionConfigDialog(ctk.CTkToplevel):
                             except Exception:
                                 pass
                         threading.Thread(target=run_ocr, daemon=True).start()
+                    else:
+                        self.lbl_elem_status.configure(
+                            text=f"✅ Знімок захоплено ({w}x{h} px) на ({cx}, {cy})",
+                            text_color="#10b981"
+                        )
 
         self._run_snip("Виділіть кнопку або пункт меню рамкою", on_done)
 
@@ -741,7 +766,10 @@ class ActionConfigDialog(ctk.CTkToplevel):
                 self.action.button = "left"
 
             if hasattr(self, "entry_element_text"):
-                self.action.element_text = self.entry_element_text.get().strip()
+                text_val = self.entry_element_text.get().strip()
+                self.action.element_text = text_val
+                if not self.action.uia_name and text_val:
+                    self.action.uia_name = text_val
             if hasattr(self, "chk_use_vision"):
                 self.action.use_vision = bool(self.chk_use_vision.get())
 

@@ -17,6 +17,18 @@ class WorkflowAction:
     target_type: str = "element"
     element_text: Optional[str] = ""        # Назва/текст елемента (наприклад, 'Додаткові дії') для семантичного розпізнавання
     
+    # Семантичний локатор UI Automation (Шар 1: pywinauto / uiautomation)
+    uia_window: Optional[str] = ""          # Назва або заголовок вікна
+    uia_control_type: Optional[str] = ""    # Тип елемента (MenuItem, Button, ListItem тощо)
+    uia_name: Optional[str] = ""            # Назва/заголовок елемента в дереві UIA
+    uia_automation_id: Optional[str] = ""   # AutomationId елемента
+    uia_class_name: Optional[str] = ""      # Клас вікна або елемента
+    
+    # Прямий друк без кліків у діалогах (через SumatraPDF / win32print / системну команду)
+    print_file_path: Optional[str] = ""     # Шлях до файлу PDF
+    printer_name: Optional[str] = ""        # Назва принтера (за замовчуванням або вказаний)
+    print_settings: Optional[str] = ""      # Параметри друку (наприклад, "duplex,paper=A4")
+
     # Для миші (базові координати)
     x: Optional[int] = None
     y: Optional[int] = None
@@ -87,12 +99,17 @@ class WorkflowAction:
         """Повертає зрозумілий користувачу опис кроку для відображення в списку дій."""
         delay_str = f"[{self.delay_before:.2f}с]" if self.delay_before > 0 else ""
         bank_count = len(self.template_bank)
+        uia_str = f" ⚡[UIA: {self.uia_name}]" if self.uia_name else ""
         vision_str = f" 🎯[Зір×{bank_count}]" if self.template_b64 and self.use_vision and bank_count > 1 else (
             " 🎯[Зір]" if self.template_b64 and self.use_vision else "")
+        badge_str = uia_str or vision_str
         text_info = f" \"{self.element_text}\"" if self.element_text else ""
         
         if self.type == "checkpoint":
             return f"🛑 ТОЧКА СХВАЛЕННЯ: \"{self.title}\" — {self.message}"
+        elif self.type == "print_file":
+            pr_name = self.printer_name or "типовий принтер"
+            return f"🖨️ Прямий друк: \"{self.print_file_path}\" ➔ [{pr_name}] {delay_str}"
         elif self.type == "area_click" or self.target_type == "area":
             rect_info = f" [Область: {self.area_rect_1}]" if self.area_rect_1 else ""
             return f"🔲 Клік по області на ({self.x}, {self.y}){rect_info} {delay_str}"
@@ -109,15 +126,14 @@ class WorkflowAction:
                 area_info = ""
             return f"📁 Пошук та вибір файлу{text_info}{area_info}{menu_info} {delay_str}"
         elif self.type == "menu_click" or self.target_type == "menu_item":
-
-            return f"📋 Пункт меню{text_info} на ({self.x}, {self.y}){vision_str} {delay_str}"
+            return f"📋 Пункт меню{text_info} на ({self.x}, {self.y}){badge_str} {delay_str}"
         elif self.type == "click":
             btn_name = "Лівий клік" if self.button == "left" else ("Правий клік" if self.button == "right" else "Клік коліщатком")
-            return f"🔘 {btn_name}{text_info} на ({self.x}, {self.y}){vision_str} {delay_str}"
+            return f"🔘 {btn_name}{text_info} на ({self.x}, {self.y}){badge_str} {delay_str}"
         elif self.type == "double_click":
-            return f"🖱️🖱️ Подвійний клік{text_info} на ({self.x}, {self.y}){vision_str} {delay_str}"
+            return f"🖱️🖱️ Подвійний клік{text_info} на ({self.x}, {self.y}){badge_str} {delay_str}"
         elif self.type == "right_click":
-            return f"🖱️ Контекстне меню (правий клік){text_info} на ({self.x}, {self.y}){vision_str} {delay_str}"
+            return f"🖱️ Контекстне меню (правий клік){text_info} на ({self.x}, {self.y}){badge_str} {delay_str}"
         elif self.type == "key_press":
             return f"⌨️ Клавіша: '{self.key}' {delay_str}"
         elif self.type == "delay":
