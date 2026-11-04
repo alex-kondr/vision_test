@@ -107,14 +107,14 @@ class WorkflowAction:
         
         if self.type == "checkpoint":
             return f"🛑 ТОЧКА СХВАЛЕННЯ: \"{self.title}\" — {self.message}"
+        elif self.type == "scroll_to_bottom" or self.scroll_to_bottom:
+            return f"📜 Прокрутка списку до самого низу (лише по вертикалі) {delay_str}"
         elif self.type == "print_file":
             pr_name = self.printer_name or "типовий принтер"
             return f"🖨️ Прямий друк: \"{self.print_file_path}\" ➔ [{pr_name}] {delay_str}"
-        elif self.type == "area_click" or self.target_type == "area":
+        elif self.type == "area_click" or (self.target_type == "area" and not self.scroll_to_bottom):
             rect_info = f" [Область: {self.area_rect_1}]" if self.area_rect_1 else ""
             return f"🔲 Клік по області на ({self.x}, {self.y}){rect_info} {delay_str}"
-        elif self.type == "scroll_to_bottom" or self.scroll_to_bottom:
-            return f"📜 Прокрутка списку до самого низу {delay_str}"
         elif self.type == "file_selection" or self.show_file_menu:
             menu_info = " [З меню вибору]" if self.show_file_menu else ""
             if self.area_rect_1 and self.area_rect_2:

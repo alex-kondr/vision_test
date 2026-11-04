@@ -571,18 +571,18 @@ class AutoFlowApp(ctk.CTk):
                 type_str = "🛑 ТОЧКА СХВАЛЕННЯ"
                 desc = f"\"{action.title}\": {action.message}"
                 tag = "checkpoint"
-            elif action.type == "area_click" or getattr(action, "target_type", "") == "area":
+            elif action.type == "scroll_to_bottom" or getattr(action, "scroll_to_bottom", False):
+                type_str = "📜 Прокрутка списку"
+                desc = "Прокрутка списку до самого низу (лише по вертикалі)"
+                vision_badge = "Навігація"
+                tag = "scroll"
+            elif action.type == "area_click" or (getattr(action, "target_type", "") == "area" and not getattr(action, "scroll_to_bottom", False)):
                 type_str = "🔲 Клік по області"
                 comment_part = f" [{action.comment}]" if action.comment else ""
                 area_part = f" Обл: {action.area_rect_1}" if getattr(action, "area_rect_1", None) else ""
                 desc = f"Фокус області на ({action.x}, {action.y}){area_part}{comment_part}"
                 vision_badge = "Область"
                 tag = "area"
-            elif action.type == "scroll_to_bottom" or getattr(action, "scroll_to_bottom", False):
-                type_str = "📜 Прокрутка списку"
-                desc = "Прокрутка списку до самого низу (PageDown/End/Коліщатко)"
-                vision_badge = "Навігація"
-                tag = "scroll"
             elif action.type == "file_selection" or getattr(action, "show_file_menu", False):
                 type_str = "📁 Вибір файлу"
                 mode_str = "Контекстне меню" if getattr(action, "show_file_menu", False) else "Авто-вибір внизу"

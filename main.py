@@ -22,9 +22,8 @@ if sys.stderr is None:
 
 def main():
     try:
-        from app import AutoFlowApp
-        app = AutoFlowApp()
-        app.mainloop()
+        from splash import run_with_splash
+        run_with_splash()
     except Exception as e:
         err_msg = traceback.format_exc()
         try:

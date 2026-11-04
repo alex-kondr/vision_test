@@ -427,11 +427,18 @@ class ActionPlayer:
             self._execute_print_file(action)
             return
 
-        # 2. Прокрутка списку до кінця (через UIA / End)
+        # 2. Прокрутка списку до самого низу (виключно вертикально)
         if action.type == "scroll_to_bottom" or getattr(action, "scroll_to_bottom", False):
             if self.on_vision_status:
-                self.on_vision_status("📜 Прокрутка списку до самого кінця (End / UIA)...")
-            UIAManager.scroll_to_bottom(window_title=action.uia_window or "", x=action.x, y=action.y)
+                self.on_vision_status("📜 Прокрутка списку до самого низу (вертикально)...")
+            sx = action.x
+            sy = action.y
+            if sx is None or sy is None:
+                rect = getattr(action, "area_rect_1", None)
+                if rect:
+                    sx = (rect[0] + rect[2]) // 2
+                    sy = (rect[1] + rect[3]) // 2
+            UIAManager.scroll_to_bottom(window_title=action.uia_window or "", x=sx, y=sy)
             time.sleep(0.2)
             return
 

@@ -322,7 +322,9 @@ class ActionConfigDialog(ctk.CTkToplevel):
         self._init_current_type()
 
     def _init_current_type(self):
-        if self.action.type == "area_click" or self.action.target_type == "area":
+        if self.action.type == "scroll_to_bottom" or getattr(self.action, "scroll_to_bottom", False):
+            self.combo_type.set(self.action_types[4])
+        elif self.action.type == "area_click" or self.action.target_type == "area":
             self.combo_type.set(self.action_types[0])
         elif self.action.type in ("click", "double_click", "right_click", "menu_click") and self.action.target_type in ("element", "menu_item", "button"):
             self.combo_type.set(self.action_types[1])
@@ -330,8 +332,6 @@ class ActionConfigDialog(ctk.CTkToplevel):
             self.combo_type.set(self.action_types[2])
         elif self.action.type == "checkpoint":
             self.combo_type.set(self.action_types[3])
-        elif self.action.type == "scroll_to_bottom" or self.action.scroll_to_bottom:
-            self.combo_type.set(self.action_types[4])
         else:
             self.combo_type.set(self.action_types[0])
         self._render_dynamic_fields()
@@ -576,15 +576,16 @@ class ActionConfigDialog(ctk.CTkToplevel):
             self.entry_cp_msg.insert("1.0", self.action.message or "Перевірте дані на екрані та натисніть 'Продовжити'.")
 
         # ============================================================
-        # 5. ПРОКРУТКА ДО НИЗУ
+        # 5. ПРОКРУТКА ДО НИЗУ (ВЕРТИКАЛЬНО)
         # ============================================================
         elif "Прокрутка" in choice:
             lbl_info = ctk.CTkLabel(
                 self.dynamic_frame,
-                text="📜 Автоматична прокрутка списку до самого кінця.\n"
-                     "Використовує коліщатко миші та клавіші PageDown/End для 100% гарантованого переходу вниз.",
+                text="📜 Автоматична прокрутка списку до самого низу (лише по вертикалі).\n\n"
+                     "• Використовує вертикальні кроки коліщатка миші (WM_MOUSEWHEEL) та UIA.\n"
+                     "• Гарантовано запобігає будь-якому горизонтальному зміщенню або переходу на праві колонки.",
                 font=ctk.CTkFont(size=12),
-                text_color="#94a3b8",
+                text_color="#38bdf8",
                 justify="left"
             )
             lbl_info.pack(anchor="w", padx=14, pady=16)
@@ -804,7 +805,14 @@ class ActionConfigDialog(ctk.CTkToplevel):
 
         elif "Прокрутка" in choice:
             self.action.type = "scroll_to_bottom"
+            self.action.target_type = "scroll"
             self.action.scroll_to_bottom = True
+            self.action.area_rect_1 = None
+            self.action.area_rect_2 = None
+            self.action.template_b64 = None
+            self.action.use_vision = False
+            if not self.action.comment or self.action.comment == "Клік по області списку":
+                self.action.comment = "Прокрутка списку до самого низу"
 
         if self.on_save:
             self.on_save(self.action)

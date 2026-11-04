@@ -259,26 +259,59 @@ class UIAManager:
         y: Optional[int] = None
     ) -> bool:
         """
-        Прокручує список або таблицю до самого кінця за допомогою UIA ScrollPattern або клавіші End.
+        Прокручує список або таблицю до самого кінця виключно по вертикалі.
+        Гарантовано виключає горизонтальне зміщення:
+          1. У UIA встановлює NoScrollValue (-1.0) для горизонтальної осі.
+          2. Використовує вертикальні імпульси коліщатка миші (WM_MOUSEWHEEL) та Ctrl+End
+             замість одинарного 'End' (який перекидає виділення в праву колонку таблиці).
         """
+        # 1. Спроба через Windows UI Automation
         if HAS_UIAUTOMATION and x is not None and y is not None:
             try:
                 ctrl = auto.ControlFromPoint(x, y)
                 if ctrl:
                     scroll_pattern = ctrl.GetScrollPattern()
                     if scroll_pattern:
-                        scroll_pattern.SetScrollPercent(auto.ScrollPercent.NoScroll, 100.0)
+                        # -1.0 для горизонтальної осі гарантує відсутність горизонтального зміщення
+                        scroll_pattern.SetScrollPercent(-1.0, 100.0)
                         return True
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"UIA scroll failed: {e}")
 
-        # Універсальний спосіб: клік у фокус списку та надсилання End
+        # 2. Чистий вертикальний рух через колесо миші та безпечний Ctrl+End
+        scrolled = False
         try:
             import pyautogui
             if x is not None and y is not None:
+                # Клік у точку для фокусу контейнера
                 pyautogui.click(x, y)
                 time.sleep(0.08)
-            pyautogui.press('end')
+                # Багаторазова вертикальна прокрутка коліщатком вниз (не зачіпає горизонталь)
+                for _ in range(6):
+                    pyautogui.scroll(-1500, x=x, y=y)
+                    time.sleep(0.03)
+            else:
+                for _ in range(6):
+                    pyautogui.scroll(-1500)
+                    time.sleep(0.03)
+            scrolled = True
+        except Exception as e:
+            logger.debug(f"pyautogui scroll failed: {e}")
+
+        # 3. Додатковий перехід до нижнього рядка через Ctrl+End (без зсуву вправо)
+        try:
+            import pyautogui
+            pyautogui.hotkey('ctrl', 'end')
             return True
         except Exception:
-            return False
+            try:
+                import pynput
+                kb = pynput.keyboard.Controller()
+                with kb.pressed(pynput.keyboard.Key.ctrl):
+                    kb.press(pynput.keyboard.Key.end)
+                    kb.release(pynput.keyboard.Key.end)
+                return True
+            except Exception as e2:
+                logger.debug(f"pynput keyboard fallback failed: {e2}")
+
+        return scrolled
