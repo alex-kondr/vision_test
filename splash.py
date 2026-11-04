@@ -198,3 +198,4 @@ def run_with_splash():
 
     splash.root.after(50, check_loaded)
     splash.root.mainloop()
+
