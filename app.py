@@ -40,8 +40,8 @@ class AutoFlowApp(ctk.CTk):
         super().__init__()
 
         self.title("AutoFlow Assistant — Автоматизація пошти та документів")
-        self.geometry("1020x760")
-        self.minsize(880, 650)
+        self.geometry("1120x780")
+        self.minsize(940, 680)
 
         # Об'єкти моделі, запису та відтворення
         self.workflow = Workflow(
@@ -53,6 +53,9 @@ class AutoFlowApp(ctk.CTk):
         
         # Лічильник навчань: кількість записів для поточного сценарію
         self._training_runs: int = 0
+        self._append_insert_idx: Optional[int] = None
+        self._retrain_start_idx: int = 0
+        self._retrain_end_idx: Optional[int] = None
 
         self.floating_bar: Optional[FloatingRecordingBar] = None
 
@@ -129,30 +132,44 @@ class AutoFlowApp(ctk.CTk):
         # Кнопка ЗАПИСАТИ (перший запис / повне перезаписування)
         self.btn_record = ctk.CTkButton(
             controls_frame,
-            text="⏺ Навчити (Запис дій)",
-            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+            text="⏺ Навчити",
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
             fg_color="#ef4444",
             hover_color="#dc2626",
-            height=40,
-            width=175,
+            height=38,
+            width=115,
             corner_radius=8,
             command=self.start_recording
         )
-        self.btn_record.pack(side="left", padx=(15, 4), pady=10)
+        self.btn_record.pack(side="left", padx=(12, 3), pady=8)
 
-        # Кнопка ДОДАТИ ЗАПИС НАВЧАННЯ (об'єднання банку шаблонів)
-        self.btn_add_training = ctk.CTkButton(
+        # Кнопка ДОЗАПИСАТИ ДІЇ (в кінець або після конкретного кроку)
+        self.btn_append = ctk.CTkButton(
             controls_frame,
-            text="🧠 +Навчання",
+            text="⏺➕ Дозапис",
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            fg_color="#dc2626",
+            hover_color="#b91c1c",
+            height=38,
+            width=115,
+            corner_radius=8,
+            command=self.open_append_recording_dialog
+        )
+        self.btn_append.pack(side="left", padx=3, pady=8)
+
+        # Кнопка ДОНАВЧАННЯ (повторне навчання з точки / шматками)
+        self.btn_retrain = ctk.CTkButton(
+            controls_frame,
+            text="🧠 Донавчання",
             font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
             fg_color="#7c3aed",
             hover_color="#6d28d9",
-            height=40,
-            width=130,
+            height=38,
+            width=125,
             corner_radius=8,
-            command=self.add_training_run
+            command=self.open_retrain_chunk_dialog
         )
-        self.btn_add_training.pack(side="left", padx=4, pady=10)
+        self.btn_retrain.pack(side="left", padx=3, pady=8)
 
         # Лічильник навчань 
         self.lbl_training_runs = ctk.CTkLabel(
@@ -160,44 +177,58 @@ class AutoFlowApp(ctk.CTk):
             text="📚 0 навч.",
             font=ctk.CTkFont(family="Segoe UI", size=11),
             text_color="#a78bfa",
-            width=60
+            width=58
         )
-        self.lbl_training_runs.pack(side="left", padx=(0, 8))
+        self.lbl_training_runs.pack(side="left", padx=(0, 4))
 
-        sep0 = ctk.CTkFrame(controls_frame, width=2, height=36, fg_color="#334155")
-        sep0.pack(side="left", padx=8, pady=10)
+        sep0 = ctk.CTkFrame(controls_frame, width=2, height=34, fg_color="#334155")
+        sep0.pack(side="left", padx=6, pady=8)
 
-        # Кнопка ВІДТВОРИТИ
+        # Кнопка ВІДТВОРИТИ ВСЕ
         self.btn_play = ctk.CTkButton(
             controls_frame,
-            text="▶ Запустити автоматизацію",
-            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+            text="▶ Запустити все",
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
             fg_color="#10b981",
             hover_color="#059669",
-            height=40,
-            width=205,
+            height=38,
+            width=135,
             corner_radius=8,
             command=self.start_playback
         )
-        self.btn_play.pack(side="left", padx=5, pady=10)
+        self.btn_play.pack(side="left", padx=3, pady=8)
+
+        # Кнопка ВІДТВОРИТИ З ОБРАНОГО / ШМАТОК
+        self.btn_play_chunk = ctk.CTkButton(
+            controls_frame,
+            text="▶️ З обраного",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            fg_color="#0284c7",
+            hover_color="#0369a1",
+            height=38,
+            width=115,
+            corner_radius=8,
+            command=self.start_playback_from_selected
+        )
+        self.btn_play_chunk.pack(side="left", padx=3, pady=8)
 
         # Кнопка ЗУПИНИТИ
         self.btn_stop = ctk.CTkButton(
             controls_frame,
             text="⏹ Зупинити (Esc)",
-            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
             fg_color="#475569",
             hover_color="#334155",
-            height=40,
-            width=135,
+            height=38,
+            width=120,
             corner_radius=8,
             state="disabled",
             command=self.stop_playback
         )
-        self.btn_stop.pack(side="left", padx=5, pady=10)
+        self.btn_stop.pack(side="left", padx=3, pady=8)
 
-        sep = ctk.CTkFrame(controls_frame, width=2, height=36, fg_color="#334155")
-        sep.pack(side="left", padx=12, pady=10)
+        sep = ctk.CTkFrame(controls_frame, width=2, height=34, fg_color="#334155")
+        sep.pack(side="left", padx=8, pady=8)
 
         # Налаштування циклів (Повторення: наприклад 50 разів)
         lbl_cycles = ctk.CTkLabel(
@@ -411,6 +442,7 @@ class AutoFlowApp(ctk.CTk):
         scrollbar.pack(side="right", fill="y")
 
         self.tree.bind("<Double-1>", lambda e: self.edit_selected_action())
+        self.tree.bind("<Button-3>", self._show_tree_context_menu)
 
         # Нижня панель дій над списком
         list_toolbar = ctk.CTkFrame(center_frame, fg_color="transparent")
@@ -683,49 +715,68 @@ class AutoFlowApp(ctk.CTk):
         self._refresh_table()
 
     # ==========================================================
-    # БАГАТОРАЗОВЕ НАВЧАННЯ (Multi-Run Training)
+    # ДОНАВЧАННЯ ШМАТКАМИ (Retraining in Chunks)
     # ==========================================================
-    def add_training_run(self):
+    def open_retrain_chunk_dialog(self, initial_step_idx: Optional[int] = None):
         """
-        Запускає додатковий запис навчання для існуючого сценарію.
-        Після запису нові знімки елементів об'єднуються з банком поточного сценарію.
-        Чим більше запусків — тим краще Gemini розпізнає елементи при різних умовах.
+        Відкриває діалогове вікно вибору початкової точки та діапазону кроків
+        для повторного навчання (донавчання шматками) Gemini Vision / Smart Vision.
         """
-        if self.recorder.is_recording:
+        if self.player.is_running or self.recorder.is_recording:
             return
 
         if not self.workflow.actions:
             messagebox.showwarning(
-                "Додати навчання",
-                "Спочатку запишіть базовий сценарій (кнопка '⏺ Навчити').",
+                "Донавчання дій",
+                "Сценарій порожній! Спочатку запишіть базові кроки (кнопка '⏺ Навчити').",
                 parent=self
             )
             return
 
-        runs = self._training_runs
-        reply = messagebox.askyesno(
-            "Додати запис навчання",
-            f"Поточний сценарій має {runs} додаткових записів навчання.\n\n"
-            f"🧠 Новий запис буде ДОДАНИЙ до банку шаблонів — Gemini Vision\n"
-            f"отримає більше прикладів і краще розпізнаватиме елементи.\n\n"
-            f"Виконайте ті ж дії, що й при першому записі.\n"
-            f"Готові розпочати?",
-            parent=self
+        if initial_step_idx is None:
+            sel_idx = self._get_selected_action_index()
+            initial_step_idx = sel_idx if sel_idx is not None else 0
+
+        RetrainChunkDialog(
+            self,
+            actions=self.workflow.actions,
+            initial_step_idx=initial_step_idx,
+            on_confirm=self.start_retrain_chunk
         )
-        if not reply:
+
+    def add_training_run(self):
+        """Сумісність зі старим викликом — відкриває діалог донавчання з першого кроку."""
+        self.open_retrain_chunk_dialog(initial_step_idx=0)
+
+    def start_retrain_chunk(self, start_idx: int, end_idx: Optional[int] = None):
+        """
+        Запускає процес донавчання (повторної демонстрації) для конкретного шматка кроків.
+        Нові знімки додаються до банку шаблонів поточного сценарію.
+        """
+        if self.recorder.is_recording or self.player.is_running:
             return
 
-        # Позначаємо режим злиття
-        self.recorder.set_existing_workflow(self.workflow)
+        total = len(self.workflow.actions)
+        start_idx = max(0, min(start_idx, total - 1))
+        eff_end = total if end_idx is None else min(end_idx, total)
+        if eff_end <= start_idx:
+            eff_end = min(start_idx + 1, total)
+
+        self._retrain_start_idx = start_idx
+        self._retrain_end_idx = eff_end
+
+        # Передаємо діапазон шматка в рекордер
+        self.recorder.set_existing_workflow(self.workflow, start_idx=start_idx, end_idx=eff_end)
         self.recorder.enable_smart_vision = self.chk_smart_vision.get()
 
+        chunk_desc = f"кроки {start_idx + 1}..{eff_end}"
         self.lbl_status_badge.configure(
-            text=f"🔴 ЗАПИС НАВЧ. #{runs + 1}",
+            text=f"🧠 ДОНАВЧ. ({chunk_desc})",
             fg_color="#6b21a8",
             text_color="#e9d5ff"
         )
         self.lbl_progress_text.configure(
-            text=f"🧠 Додатковий запис навчання #{runs + 1}. Виконайте ті ж дії. F10 — завершити."
+            text=f"🧠 Донавчання ({chunk_desc}): виконайте дії цієї ділянки повторно. F10 — завершити."
         )
 
         self.floating_bar = FloatingRecordingBar(
@@ -736,15 +787,17 @@ class AutoFlowApp(ctk.CTk):
             on_position_changed=self._on_floating_bar_moved,
             on_set_target_type=self.recorder.set_target_type,
             on_add_scroll=self.recorder.add_scroll_to_bottom,
-            on_add_file_selection=self.recorder.add_file_selection
+            on_add_file_selection=self.recorder.add_file_selection,
+            mode_title="🧠 ДОНАВЧАННЯ",
+            mode_color="#a855f7",
+            info_text=f"Шматок: {start_idx+1}..{eff_end}"
         )
-
 
         self.iconify()
         self.recorder.start_recording()
 
     def _stop_training_run(self):
-        """Зупиняє додатковий запис навчання та об'єднує банки шаблонів."""
+        """Зупиняє повторне навчання шматка та об'єднує нові знімки з банком шаблонів."""
         if not self.recorder.is_recording:
             return
 
@@ -761,8 +814,8 @@ class AutoFlowApp(ctk.CTk):
         self.lift()
         self.focus_force()
 
-        # Об'єднуємо банки шаблонів
-        merged = self.recorder.merge_template_banks(new_actions)
+        # Об'єднуємо банки шаблонів для вказаного шматка
+        merged, updated_count, leftover = self.recorder.merge_template_banks(new_actions)
         self.workflow.actions = merged
         self.recorder.set_existing_workflow(None)
 
@@ -778,33 +831,109 @@ class AutoFlowApp(ctk.CTk):
         )
         self._refresh_table()
 
+        start_num = getattr(self, "_retrain_start_idx", 0) + 1
+        end_num = getattr(self, "_retrain_end_idx", len(self.workflow.actions))
         v_count = sum(1 for a in new_actions if a.template_b64)
+
+        extra_msg = ""
+        if leftover:
+            reply = messagebox.askyesno(
+                "Додаткові нові кроки",
+                f"Під час донавчання записано {len(leftover)} нових дій, яких не було у вихідному шматку.\n\n"
+                f"Бажаєте додати їх до списку сценарію після кроку №{end_num}?",
+                parent=self
+            )
+            if reply:
+                pos = min(end_num, len(self.workflow.actions))
+                self.workflow.actions[pos:pos] = leftover
+                self._refresh_table()
+                extra_msg = f"\n• Додано нових дій до сценарію: {len(leftover)}"
+
         messagebox.showinfo(
-            "Навчання додано!",
-            f"✅ Запис навчання #{self._training_runs} успішно додано до банку шаблонів!\n\n"
-            f"• Нових знімків елементів: {v_count}\n"
-            f"• Загалом записів навчання: {self._training_runs}\n\n"
-            f"Gemini Vision тепер має більше прикладів для точнішого розпізнавання!",
+            "Донавчання завершено!",
+            f"✅ Шматок кроків {start_num}..{end_num} успішно донавчено!\n\n"
+            f"• Оновлено дій у банку шаблонів: {updated_count}\n"
+            f"• Захоплено знімків: {v_count}\n"
+            f"• Загалом запусків навчання: {self._training_runs}{extra_msg}\n\n"
+            f"Gemini Vision та Smart Vision тепер мають ще більше зразків для безпомилкового розпізнавання!",
             parent=self
         )
 
     # ==========================================================
-    # ЗАПИС ДІЙ
+    # ДОЗАПИС ДІЙ (Append / Insert Recording)
+    # ==========================================================
+    def open_append_recording_dialog(self, selected_idx: Optional[int] = None):
+        """Відкриває діалогове вікно вибору точки для дозапису нових дій у сценарій."""
+        if self.player.is_running or self.recorder.is_recording:
+            return
+
+        if selected_idx is None:
+            selected_idx = self._get_selected_action_index()
+
+        AppendActionsDialog(
+            self,
+            actions=self.workflow.actions,
+            selected_idx=selected_idx,
+            on_confirm=self.start_append_recording
+        )
+
+    def start_append_recording(self, insert_idx: int):
+        """Починає дозапис дій з подальшою вставкою у позицію insert_idx."""
+        if self.recorder.is_recording or self.player.is_running:
+            return
+
+        total = len(self.workflow.actions)
+        self._append_insert_idx = max(0, min(insert_idx, total))
+        self.recorder.enable_smart_vision = self.chk_smart_vision.get()
+
+        desc = f"після кроку #{self._append_insert_idx}" if 0 < self._append_insert_idx < total else (
+            "в кінець" if self._append_insert_idx >= total else "на початок"
+        )
+
+        self.lbl_status_badge.configure(
+            text="🔴 ДОЗАПИС ДІЙ",
+            fg_color="#7f1d1d",
+            text_color="#fca5a5"
+        )
+        self.lbl_progress_text.configure(
+            text=f"⏺ Триває дозапис нових дій ({desc}). F8 — точка, F9 — пауза, F10 — завершити."
+        )
+
+        self.floating_bar = FloatingRecordingBar(
+            self,
+            on_add_checkpoint=self._add_checkpoint_from_floating_bar,
+            on_toggle_pause=self.recorder.toggle_pause,
+            on_stop_recording=self.stop_recording,
+            on_position_changed=self._on_floating_bar_moved,
+            on_set_target_type=self.recorder.set_target_type,
+            on_add_scroll=self.recorder.add_scroll_to_bottom,
+            on_add_file_selection=self.recorder.add_file_selection,
+            mode_title="🔴 ДОЗАПИС",
+            mode_color="#ef4444",
+            info_text=f"Вставка: #{self._append_insert_idx}"
+        )
+
+        self.iconify()
+        self.recorder.start_recording()
+
+    # ==========================================================
+    # ПОВНИЙ ЗАПИС ДІЙ
     # ==========================================================
     def start_recording(self):
-        if self.recorder.is_recording:
+        if self.recorder.is_recording or self.player.is_running:
             return
 
         if self.workflow.actions:
             reply = messagebox.askyesno(
                 "Новий запис дій",
-                "У сценарії вже є записані дії.\nОчистити список перед початком нового запису?\n\n(Ні — додасть нові дії в кінець)",
+                "У сценарії вже є записані дії.\nОчистити список перед початком нового запису?\n\n(Ні — додасть нові дії в кінець списку)",
                 parent=self
             )
             if reply:
                 self.workflow.actions.clear()
                 self._refresh_table()
 
+        self._append_insert_idx = None
         self.recorder.enable_smart_vision = self.chk_smart_vision.get()
 
         self.lbl_status_badge.configure(
@@ -824,9 +953,10 @@ class AutoFlowApp(ctk.CTk):
             on_position_changed=self._on_floating_bar_moved,
             on_set_target_type=self.recorder.set_target_type,
             on_add_scroll=self.recorder.add_scroll_to_bottom,
-            on_add_file_selection=self.recorder.add_file_selection
+            on_add_file_selection=self.recorder.add_file_selection,
+            mode_title="🔴 ЗАПИС",
+            mode_color="#ef4444"
         )
-
 
         self.iconify()
         self.recorder.start_recording()
@@ -869,7 +999,10 @@ class AutoFlowApp(ctk.CTk):
         self.after(0, update)
 
     def _on_recorder_action(self, action: WorkflowAction):
-        pass
+        def update():
+            if self.floating_bar:
+                self.floating_bar.update_action_count(len(self.recorder.actions))
+        self.after(0, update)
 
     def _stop_recording_from_hotkey(self):
         self.after(0, self.stop_recording)
@@ -879,7 +1012,18 @@ class AutoFlowApp(ctk.CTk):
             return
 
         actions = self.recorder.stop_recording()
-        self.workflow.actions.extend(actions)
+
+        insert_idx = getattr(self, "_append_insert_idx", None)
+        if insert_idx is not None:
+            insert_idx = max(0, min(insert_idx, len(self.workflow.actions)))
+            self.workflow.actions[insert_idx:insert_idx] = actions
+            self._append_insert_idx = None
+            msg_target = f"вставлено {len(actions)} дій після кроку #{insert_idx}" if insert_idx > 0 else f"додано {len(actions)} дій на початок"
+            new_select_iid = str(min(insert_idx, len(self.workflow.actions) - 1))
+        else:
+            self.workflow.actions.extend(actions)
+            msg_target = f"записано {len(actions)} дій"
+            new_select_iid = str(len(self.workflow.actions) - 1) if self.workflow.actions else "0"
 
         if self.floating_bar:
             try:
@@ -899,25 +1043,33 @@ class AutoFlowApp(ctk.CTk):
         )
         self._refresh_table()
 
+        if self.tree.exists(new_select_iid):
+            self.tree.selection_set(new_select_iid)
+            self.tree.see(new_select_iid)
+
         total = len(actions)
         cps = sum(1 for a in actions if a.type == "checkpoint")
         v_anchors = sum(1 for a in actions if a.template_b64)
         messagebox.showinfo(
             "Запис завершено",
-            f"Успішно записано {total} дій!\n"
+            f"Успішно {msg_target}!\n"
             f"• Точок схвалення оператора: {cps}\n"
             f"• Захоплено Smart Vision якорів: {v_anchors}\n\n"
-            f"Програма готова до відтворення та знайде потрібні поля й меню навіть якщо вони змістяться!",
+            f"Сценарій оновлено та готовий до виконання!",
             parent=self
         )
 
     # ==========================================================
-    # ВІДТВОРЕННЯ (PLAYBACK) ТА ЦИКЛИ
+    # ВІДТВОРЕННЯ (PLAYBACK) ТА ЦИКЛИ (У Т.Ч. ШМАТКАМИ)
     # ==========================================================
-    def start_playback(self):
+    def start_playback(self, start_step: int = 0, end_step: Optional[int] = None):
+        """Запускає виконання сценарію або вибраного шматка дій."""
         if not self.workflow.actions:
             messagebox.showwarning("Немає дій", "Сценарій порожній! Запишіть дії або завантажте зразок.", parent=self)
             return
+
+        total_actions = len(self.workflow.actions)
+        start_step = max(0, min(start_step, total_actions - 1))
 
         try:
             cycles = int(self.spin_cycles.get())
@@ -937,11 +1089,23 @@ class AutoFlowApp(ctk.CTk):
         self.workflow.use_smart_vision = self.chk_smart_vision.get()
 
         self.btn_record.configure(state="disabled")
+        if hasattr(self, "btn_append"):
+            self.btn_append.configure(state="disabled")
+        if hasattr(self, "btn_retrain"):
+            self.btn_retrain.configure(state="disabled")
         self.btn_play.configure(state="disabled")
+        if hasattr(self, "btn_play_chunk"):
+            self.btn_play_chunk.configure(state="disabled")
         self.btn_stop.configure(state="normal")
 
+        eff_end = total_actions if end_step is None else min(end_step, total_actions)
+        if start_step > 0 or end_step is not None:
+            badge_title = f"🔵 ШМАТОК ({start_step + 1}..{eff_end})"
+        else:
+            badge_title = "🔵 ВИКОНАННЯ СЦЕНАРІЮ"
+
         self.lbl_status_badge.configure(
-            text="🔵 ВИКОНАННЯ СЦЕНАРІЮ",
+            text=badge_title,
             fg_color="#0369a1",
             text_color="#e0f2fe"
         )
@@ -952,8 +1116,107 @@ class AutoFlowApp(ctk.CTk):
             workflow=self.workflow,
             cycles=cycles,
             speed=speed,
-            pause_between_cycles=pause_cycle
+            pause_between_cycles=pause_cycle,
+            start_step=start_step,
+            end_step=end_step
         )
+
+    def start_playback_from_selected(self):
+        """Запускає виконання сценарію, починаючи з поточного обраного в таблиці кроку."""
+        sel_idx = self._get_selected_action_index()
+        if sel_idx is None:
+            messagebox.showinfo(
+                "Виконання з кроку",
+                "Оберіть крок у списку нижче, з якого бажаєте розпочати виконання.",
+                parent=self
+            )
+            return
+        self.start_playback(start_step=sel_idx)
+
+    def test_single_action(self, step_idx: Optional[int] = None):
+        """Виконує ТІЛЬКИ один окремий крок для швидкої перевірки розпізнавання та дії."""
+        if step_idx is None:
+            step_idx = self._get_selected_action_index()
+        if step_idx is None:
+            return
+        self.start_playback(start_step=step_idx, end_step=step_idx + 1)
+
+    def _get_selected_action_index(self) -> Optional[int]:
+        """Повертає числовий індекс поточної вибраної дії у таблиці (0-based) або None."""
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        try:
+            return int(sel[0])
+        except (ValueError, TypeError):
+            return None
+
+    def _show_tree_context_menu(self, event):
+        """Відображає інтерактивне контекстне меню дій для обраного рядка списку."""
+        if self.player.is_running or self.recorder.is_recording:
+            return
+
+        iid = self.tree.identify_row(event.y)
+        if iid:
+            self.tree.selection_set(iid)
+
+        idx = self._get_selected_action_index()
+        if idx is None or idx < 0 or idx >= len(self.workflow.actions):
+            return
+
+        act = self.workflow.actions[idx]
+        step_num = idx + 1
+
+        menu = tk.Menu(
+            self,
+            tearoff=0,
+            bg="#1e293b",
+            fg="#f8fafc",
+            activebackground="#2563eb",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 10)
+        )
+
+        menu.add_command(
+            label=f"▶️ Запустити з цього кроку (№{step_num} до кінця)",
+            command=lambda: self.start_playback(start_step=idx)
+        )
+        menu.add_command(
+            label=f"🔬 Протестувати тільки крок №{step_num}",
+            command=lambda: self.test_single_action(step_idx=idx)
+        )
+        menu.add_separator()
+        menu.add_command(
+            label=f"🧠 Донавчити шматок з кроку №{step_num}...",
+            command=lambda: self.open_retrain_chunk_dialog(initial_step_idx=idx)
+        )
+        menu.add_command(
+            label=f"⏺➕ Дозаписати нові дії після кроку №{step_num}...",
+            command=lambda: self.open_append_recording_dialog(selected_idx=idx)
+        )
+        menu.add_separator()
+        menu.add_command(
+            label=f"✏️ Редагувати крок №{step_num}",
+            command=self.edit_selected_action
+        )
+        menu.add_command(
+            label=f"🗑️ Видалити крок №{step_num}",
+            command=self.delete_selected_action
+        )
+        menu.add_separator()
+        menu.add_command(
+            label="⬆️ Перемістити вгору",
+            command=lambda: self._move_action(-1)
+        )
+        menu.add_command(
+            label="⬇️ Перемістити вниз",
+            command=lambda: self._move_action(1)
+        )
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def stop_playback(self):
         self.player.abort()
@@ -1002,6 +1265,11 @@ class AutoFlowApp(ctk.CTk):
             self.lbl_progress_text.configure(
                 text=f"Лист {self.player.current_cycle}/{self.player.total_cycles} • Крок {step_idx + 1}/{total_steps}: {action.get_display_text()}"
             )
+            start_s = getattr(self.player, "start_step", 0)
+            end_s = getattr(self.player, "end_step", None) or total_steps
+            span = max(1, end_s - start_s)
+            curr = max(0, min(span, step_idx - start_s + 1))
+            self.progress_bar.set(curr / span)
         self.after(0, update)
 
     def _on_player_checkpoint(self, action: WorkflowAction, step_idx: int, total_steps: int):
@@ -1055,7 +1323,13 @@ class AutoFlowApp(ctk.CTk):
     def _on_player_finished(self, success: bool, message: str):
         def update():
             self.btn_record.configure(state="normal")
+            if hasattr(self, "btn_append"):
+                self.btn_append.configure(state="normal")
+            if hasattr(self, "btn_retrain"):
+                self.btn_retrain.configure(state="normal")
             self.btn_play.configure(state="normal")
+            if hasattr(self, "btn_play_chunk"):
+                self.btn_play_chunk.configure(state="normal")
             self.btn_stop.configure(state="disabled")
 
             badge_color = "#1e3a8a" if success else "#7f1d1d"

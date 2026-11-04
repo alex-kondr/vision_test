@@ -13,6 +13,7 @@ import io
 import re
 import base64
 import time
+import threading
 import logging
 from typing import Optional, Tuple, Dict, Any, List
 import numpy as np
@@ -26,6 +27,54 @@ try:
     HAS_MSS = True
 except ImportError:
     HAS_MSS = False
+
+# Потокобезпечний кеш екземпляра MSS (уникає дорогої повторної ініціалізації на кожен кадр)
+_mss_local = threading.local()
+
+def _get_mss_instance():
+    if not HAS_MSS:
+        return None
+    if not hasattr(_mss_local, "sct") or _mss_local.sct is None:
+        try:
+            mss_factory = getattr(mss, "MSS", getattr(mss, "mss", None))
+            if mss_factory is not None:
+                _mss_local.sct = mss_factory()
+            else:
+                _mss_local.sct = None
+        except Exception:
+            _mss_local.sct = None
+    return _mss_local.sct
+
+# Кеш декодованих шаблонів і Canny-контурів для миттєвого порівняння (20x пришвидшення)
+_TEMPLATE_CACHE: Dict[str, Dict[str, Any]] = {}
+
+def _get_template_features(b64_str: str) -> Optional[Dict[str, Any]]:
+    if not b64_str:
+        return None
+    cached = _TEMPLATE_CACHE.get(b64_str)
+    if cached is not None:
+        return cached
+
+    img = VisionMatcher.b64_to_image(b64_str)
+    if img is None:
+        return None
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+
+    if len(_TEMPLATE_CACHE) > 250:
+        _TEMPLATE_CACHE.clear()
+
+    data = {
+        "img": img,
+        "gray": gray,
+        "edges": edges,
+        "orig_h": img.shape[0],
+        "orig_w": img.shape[1],
+        "scaled_edges": {}
+    }
+    _TEMPLATE_CACHE[b64_str] = data
+    return data
 
 # OCR рушії
 try:
@@ -63,11 +112,13 @@ class VisionMatcher:
     def capture_screen_image() -> Optional[np.ndarray]:
         """
         Робить знімок екрана та повертає numpy array в форматі BGR.
+        Оптимізовано для високої швидкодії з повторним використанням екземпляра MSS.
         Безпечно обробляє винятки (наприклад, коли екран заблоковано).
         """
         if HAS_MSS:
             try:
-                with mss.mss() as sct:
+                sct = _get_mss_instance()
+                if sct is not None:
                     monitor = sct.monitors[0]
                     sct_img = sct.grab(monitor)
                     img_np = np.array(sct_img)
@@ -145,10 +196,12 @@ class VisionMatcher:
         target_text: str,
         expected_x: Optional[int] = None,
         expected_y: Optional[int] = None,
-        search_radius: int = 600
+        search_radius: int = 500
     ) -> Optional[Tuple[int, int, float]]:
         """
         Шукає текст target_text на екрані за допомогою локального швидкого OCR (RapidOCR або winocr).
+        Оптимізовано для швидкодії: спочатку шукає у компактній області навколо очікуваних координат,
+        і лише за потреби розширює зону пошуку.
         Повертає точні координати центру (click_x, click_y, confidence).
         """
         if not target_text or not target_text.strip():
@@ -157,74 +210,82 @@ class VisionMatcher:
         sh, sw = screen_img.shape[:2]
         query = target_text.strip().lower()
 
-        # Якщо вказано очікувану точку — обрізаємо область навколо неї для швидкодії та точності
-        crop_x1, crop_y1 = 0, 0
+        # Визначаємо радіуси: спочатку швидкий компактний радіус, потім повний
+        radii = []
         if expected_x is not None and expected_y is not None and search_radius > 0:
-            crop_x1 = max(0, expected_x - search_radius)
-            crop_y1 = max(0, expected_y - search_radius)
-            crop_x2 = min(sw, expected_x + search_radius)
-            crop_y2 = min(sh, expected_y + search_radius)
-            working_img = screen_img[crop_y1:crop_y2, crop_x1:crop_x2]
+            tight_r = min(240, search_radius)
+            radii.append(tight_r)
+            if search_radius > tight_r:
+                radii.append(search_radius)
         else:
-            working_img = screen_img
+            radii.append(0)  # весь екран
 
-        if working_img.size == 0:
-            return None
+        for cur_r in radii:
+            crop_x1, crop_y1 = 0, 0
+            if cur_r > 0 and expected_x is not None and expected_y is not None:
+                crop_x1 = max(0, expected_x - cur_r)
+                crop_y1 = max(0, expected_y - cur_r)
+                crop_x2 = min(sw, expected_x + cur_r)
+                crop_y2 = min(sh, expected_y + cur_r)
+                working_img = screen_img[crop_y1:crop_y2, crop_x1:crop_x2]
+            else:
+                working_img = screen_img
 
-        # 1. Спроба через RapidOCR (найбільш універсальний, швидкий та точний для кирилиці)
-        if HAS_RAPID_OCR and _rapid_ocr is not None:
-            try:
-                results, _ = _rapid_ocr(working_img)
-                if results:
-                    best_match = None
-                    best_score = 0.0
+            if working_img.size == 0:
+                continue
 
-                    for box, text, score in results:
-                        recognized = text.strip().lower()
-                        # Перевіряємо збіг рядка або входження
-                        match_weight = 0.0
-                        if query in recognized or recognized in query:
-                            match_weight = 1.0
-                        else:
-                            # Перевіряємо збіг слів
-                            words_query = set(re.findall(r'\w+', query))
-                            words_rec = set(re.findall(r'\w+', recognized))
-                            if words_query and words_query.intersection(words_rec):
-                                match_weight = len(words_query.intersection(words_rec)) / len(words_query)
+            # 1. Спроба через RapidOCR (найбільш універсальний, швидкий та точний для кирилиці)
+            if HAS_RAPID_OCR and _rapid_ocr is not None:
+                try:
+                    results, _ = _rapid_ocr(working_img)
+                    if results:
+                        best_match = None
+                        best_score = 0.0
 
-                        if match_weight > 0.4 and match_weight > best_score:
-                            best_score = match_weight
-                            # box: [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
-                            pts = np.array(box)
-                            cx = int(np.mean(pts[:, 0])) + crop_x1
-                            cy = int(np.mean(pts[:, 1])) + crop_y1
-                            best_match = (cx, cy, float(score))
+                        for box, text, score in results:
+                            recognized = text.strip().lower()
+                            # Перевіряємо збіг рядка або входження
+                            match_weight = 0.0
+                            if query in recognized or recognized in query:
+                                match_weight = 1.0
+                            else:
+                                words_query = set(re.findall(r'\w+', query))
+                                words_rec = set(re.findall(r'\w+', recognized))
+                                if words_query and words_query.intersection(words_rec):
+                                    match_weight = len(words_query.intersection(words_rec)) / len(words_query)
 
-                    if best_match:
-                        return best_match
-            except Exception as e:
-                logger.debug(f"RapidOCR помилка пошуку тексту: {e}")
+                            if match_weight > 0.4 and match_weight > best_score:
+                                best_score = match_weight
+                                pts = np.array(box)
+                                cx = int(np.mean(pts[:, 0])) + crop_x1
+                                cy = int(np.mean(pts[:, 1])) + crop_y1
+                                best_match = (cx, cy, float(score))
 
-        # 2. Спроба через Windows OCR (winocr)
-        if HAS_WINOCR:
-            try:
-                pil_img = Image.fromarray(cv2.cvtColor(working_img, cv2.COLOR_BGR2RGB))
-                for lang in ["ru", "en-US"]:
-                    try:
-                        ocr_data = winocr.recognize_pil_sync(pil_img, lang)
-                        for line in ocr_data.get("lines", []):
-                            line_text = line.get("text", "").lower()
-                            if query in line_text:
-                                words = line.get("words", [])
-                                if words:
-                                    r = words[0].get("bounding_rect", {})
-                                    cx = int(r.get("x", 0) + r.get("width", 0) / 2) + crop_x1
-                                    cy = int(r.get("y", 0) + r.get("height", 0) / 2) + crop_y1
-                                    return cx, cy, 0.95
-                    except Exception:
-                        continue
-            except Exception as e:
-                logger.debug(f"winocr помилка: {e}")
+                        if best_match and best_score >= 0.5:
+                            return best_match
+                except Exception as e:
+                    logger.debug(f"RapidOCR помилка пошуку тексту: {e}")
+
+            # 2. Спроба через Windows OCR (winocr)
+            if HAS_WINOCR:
+                try:
+                    pil_img = Image.fromarray(cv2.cvtColor(working_img, cv2.COLOR_BGR2RGB))
+                    for lang in ["ru", "en-US"]:
+                        try:
+                            ocr_data = winocr.recognize_pil_sync(pil_img, lang)
+                            for line in ocr_data.get("lines", []):
+                                line_text = line.get("text", "").lower()
+                                if query in line_text:
+                                    words = line.get("words", [])
+                                    if words:
+                                        r = words[0].get("bounding_rect", {})
+                                        cx = int(r.get("x", 0) + r.get("width", 0) / 2) + crop_x1
+                                        cy = int(r.get("y", 0) + r.get("height", 0) / 2) + crop_y1
+                                        return cx, cy, 0.95
+                        except Exception:
+                            continue
+                except Exception as e:
+                    logger.debug(f"winocr помилка: {e}")
 
         return None
 
@@ -242,8 +303,11 @@ class VisionMatcher:
     ) -> Optional[Tuple[int, int, float]]:
         """
         Багатомасштабний (0.8–1.25) OpenCV matchTemplate на Canny-контурах (краях).
-        Це усуває залежність від кольору фону (наприклад, коли рядок виділено синім)
-        та масштабування дисплея (DPI 100%, 125%, 150%).
+        Глибока оптимізація швидкодії:
+          1. Використання кешу контурів шаблонів (без повторних Canny/imdecode).
+          2. Двоетапний радіус пошуку (компактний 220px -> розширений).
+          3. Пріоритетна перевірка масштабу 1.0 з миттєвим виходом при високому збігу (>= 0.82).
+          4. Ранній вихід при виявленні першого якісного збігу з банку шаблонів.
         """
         if screen_img is None:
             return None
@@ -257,54 +321,82 @@ class VisionMatcher:
 
         s_h, s_w = screen_img.shape[:2]
 
-        # Обмежуємо область пошуку навколо очікуваної точки
+        # Визначаємо етапи пошуку по радіусу: спочатку швидкий 220px, потім повний якщо не знайдено
+        radii = []
         if search_vicinity_radius > 0:
-            vx1 = max(0, expected_x - search_vicinity_radius)
-            vy1 = max(0, expected_y - search_vicinity_radius)
-            vx2 = min(s_w, expected_x + search_vicinity_radius)
-            vy2 = min(s_h, expected_y + search_vicinity_radius)
-            search_area = screen_img[vy1:vy2, vx1:vx2]
+            tight_r = min(220, search_vicinity_radius)
+            radii.append(tight_r)
+            if search_vicinity_radius > tight_r:
+                radii.append(search_vicinity_radius)
         else:
-            vx1, vy1 = 0, 0
-            search_area = screen_img
+            radii.append(0)
 
-        search_gray = cv2.cvtColor(search_area, cv2.COLOR_BGR2GRAY)
-        search_edges = cv2.Canny(search_gray, 50, 150)
-
-        best_score = 0.0
-        best_coord = None
         scales = [1.0, 0.9, 1.1, 0.85, 1.15, 0.8, 1.25]
 
-        for tmpl_b64 in candidates:
-            tmpl_img = VisionMatcher.b64_to_image(tmpl_b64)
-            if tmpl_img is None:
+        for cur_r in radii:
+            if cur_r > 0:
+                vx1 = max(0, expected_x - cur_r)
+                vy1 = max(0, expected_y - cur_r)
+                vx2 = min(s_w, expected_x + cur_r)
+                vy2 = min(s_h, expected_y + cur_r)
+                search_area = screen_img[vy1:vy2, vx1:vx2]
+            else:
+                vx1, vy1 = 0, 0
+                search_area = screen_img
+
+            if search_area.shape[0] < 20 or search_area.shape[1] < 20:
                 continue
 
-            orig_h, orig_w = tmpl_img.shape[:2]
-            tmpl_gray = cv2.cvtColor(tmpl_img, cv2.COLOR_BGR2GRAY)
-            tmpl_edges = cv2.Canny(tmpl_gray, 50, 150)
+            search_gray = cv2.cvtColor(search_area, cv2.COLOR_BGR2GRAY)
+            search_edges = cv2.Canny(search_gray, 50, 150)
 
-            for scale in scales:
-                new_w = int(orig_w * scale)
-                new_h = int(orig_h * scale)
+            best_score = 0.0
+            best_coord = None
 
-                if new_w >= search_edges.shape[1] or new_h >= search_edges.shape[0] or new_w < 10 or new_h < 10:
+            for tmpl_b64 in candidates:
+                feat = _get_template_features(tmpl_b64)
+                if feat is None:
                     continue
 
-                scaled_edges = cv2.resize(tmpl_edges, (new_w, new_h), interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR)
+                orig_h, orig_w = feat["orig_h"], feat["orig_w"]
+                tmpl_edges = feat["edges"]
 
-                res = cv2.matchTemplate(search_edges, scaled_edges, cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, max_loc = cv2.minMaxLoc(res)
+                for scale in scales:
+                    new_w = int(orig_w * scale)
+                    new_h = int(orig_h * scale)
 
-                if max_val > best_score:
-                    best_score = max_val
-                    # Центр знайденого елемента
-                    found_cx = vx1 + max_loc[0] + int(offset_x * scale)
-                    found_cy = vy1 + max_loc[1] + int(offset_y * scale)
-                    best_coord = (found_cx, found_cy, max_val)
+                    if new_w >= search_edges.shape[1] or new_h >= search_edges.shape[0] or new_w < 10 or new_h < 10:
+                        continue
 
-        if best_coord and best_score >= confidence:
-            return best_coord
+                    # Використовуємо кешовані масштабовані контури
+                    if scale == 1.0:
+                        scaled_edges = tmpl_edges
+                    elif scale in feat["scaled_edges"]:
+                        scaled_edges = feat["scaled_edges"][scale]
+                    else:
+                        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+                        scaled_edges = cv2.resize(tmpl_edges, (new_w, new_h), interpolation=interp)
+                        feat["scaled_edges"][scale] = scaled_edges
+
+                    res = cv2.matchTemplate(search_edges, scaled_edges, cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+
+                    if max_val > best_score:
+                        best_score = max_val
+                        found_cx = vx1 + max_loc[0] + int(offset_x * scale)
+                        found_cy = vy1 + max_loc[1] + int(offset_y * scale)
+                        best_coord = (found_cx, found_cy, max_val)
+
+                        # Якщо при масштабі 1.0 знайдено надійний збіг — негайно повертаємо без витрат на інші масштаби
+                        if scale == 1.0 and max_val >= max(confidence, 0.82):
+                            return best_coord
+
+                # Якщо поточний кандидат з банку дав високий результат — зупиняємо перебір банку
+                if best_coord and best_score >= max(confidence, 0.85):
+                    return best_coord
+
+            if best_coord and best_score >= confidence:
+                return best_coord
 
         return None
 

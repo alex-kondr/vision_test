@@ -61,9 +61,12 @@ def set_api_key(api_key: str):
     os.environ["GEMINI_API_KEY"] = api_key
 
 
-def _img_np_to_b64(img: np.ndarray, fmt: str = ".png") -> str:
-    """Конвертує numpy BGR-зображення у base64 рядок."""
-    success, buf = cv2.imencode(fmt, img)
+def _img_np_to_b64(img: np.ndarray, fmt: str = ".jpg") -> str:
+    """Конвертує numpy BGR-зображення у base64 рядок (за замовчуванням оптимізований якісний JPEG 85%)."""
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, 85] if fmt.lower() in (".jpg", ".jpeg") else []
+    success, buf = cv2.imencode(fmt, img, encode_params)
+    if not success:
+        success, buf = cv2.imencode(".png", img)
     if not success:
         raise ValueError("Не вдалося закодувати зображення")
     return base64.b64encode(buf).decode("utf-8")
@@ -78,7 +81,7 @@ def _b64_to_img(b64: str) -> Optional[np.ndarray]:
     except Exception:
         return None
 
-PREFERRED_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+PREFERRED_MODELS = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash"]
 
 
 def _call_gemini_with_fallback(client: Any, parts: List[Any], max_tokens: int = 256) -> Optional[str]:
@@ -150,10 +153,10 @@ def find_element_with_gemini(
 
         parts = []
 
-        # Знімок екрана
+        # Знімок екрана (швидкий JPEG)
         parts.append(genai_types.Part.from_bytes(
             data=base64.b64decode(screen_b64),
-            mime_type="image/png"
+            mime_type="image/jpeg"
         ))
 
         # Шаблони
@@ -265,7 +268,7 @@ def detect_files_on_screen(
         parts = [
             genai_types.Part.from_bytes(
                 data=base64.b64decode(img_b64),
-                mime_type="image/png"
+                mime_type="image/jpeg"
             ),
             genai_types.Part.from_text(text=(
                 f"На зображенні — вікно або область програми зі списком файлів/документів (розмір: {iw}x{ih} px).\n"
