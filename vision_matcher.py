@@ -76,14 +76,33 @@ def _get_template_features(b64_str: str) -> Optional[Dict[str, Any]]:
     _TEMPLATE_CACHE[b64_str] = data
     return data
 
-# OCR рушії
-try:
-    from rapidocr_onnxruntime import RapidOCR
-    _rapid_ocr = RapidOCR()
-    HAS_RAPID_OCR = True
-except ImportError:
-    _rapid_ocr = None
-    HAS_RAPID_OCR = False
+# OCR рушії (лінива ініціалізація для миттєвого запуску програми)
+_rapid_ocr = None
+_rapid_ocr_checked = False
+_ocr_lock = threading.Lock()
+HAS_RAPID_OCR = True
+
+def _get_rapid_ocr():
+    """Потокобезпечно ініціалізує RapidOCR лише при першому зверненні або фоновому прогріві."""
+    global _rapid_ocr, _rapid_ocr_checked, HAS_RAPID_OCR
+    if _rapid_ocr_checked:
+        return _rapid_ocr
+    with _ocr_lock:
+        if not _rapid_ocr_checked:
+            try:
+                from rapidocr_onnxruntime import RapidOCR
+                _rapid_ocr = RapidOCR()
+                HAS_RAPID_OCR = True
+            except Exception as e:
+                logger.debug(f"RapidOCR недоступний: {e}")
+                _rapid_ocr = None
+                HAS_RAPID_OCR = False
+            _rapid_ocr_checked = True
+    return _rapid_ocr
+
+def warmup_ocr_async():
+    """Фоновий прогрів OCR рушія після відкриття головного вікна."""
+    threading.Thread(target=_get_rapid_ocr, daemon=True).start()
 
 try:
     import winocr
@@ -235,9 +254,10 @@ class VisionMatcher:
                 continue
 
             # 1. Спроба через RapidOCR (найбільш універсальний, швидкий та точний для кирилиці)
-            if HAS_RAPID_OCR and _rapid_ocr is not None:
+            ocr_engine = _get_rapid_ocr() if HAS_RAPID_OCR else None
+            if ocr_engine is not None:
                 try:
-                    results, _ = _rapid_ocr(working_img)
+                    results, _ = ocr_engine(working_img)
                     if results:
                         best_match = None
                         best_score = 0.0
@@ -428,19 +448,7 @@ class VisionMatcher:
         if screen_img is None:
             return None
 
-        # === ШАР 3a: Швидкий локальний OCR (пошук за семантичним текстом) ===
-        if element_text and element_text.strip():
-            ocr_res = VisionMatcher.find_text_with_ocr(
-                screen_img=screen_img,
-                target_text=element_text,
-                expected_x=expected_x,
-                expected_y=expected_y,
-                search_radius=search_vicinity_radius
-            )
-            if ocr_res:
-                return ocr_res
-
-        # === ШАР 3b: Багатомасштабний OpenCV matchTemplate на краях ===
+        # === ШАР 3a: Надшвидкий багатомасштабний OpenCV matchTemplate на краях (~2-5 мс) ===
         if template_b64 or template_bank:
             cv_res = VisionMatcher._find_with_opencv_multiscale(
                 template_b64=template_b64,
@@ -455,6 +463,18 @@ class VisionMatcher:
             )
             if cv_res:
                 return cv_res
+
+        # === ШАР 3b: Локальний OCR (пошук за семантичним текстом, якщо візуальний шаблон змінився) ===
+        if element_text and element_text.strip():
+            ocr_res = VisionMatcher.find_text_with_ocr(
+                screen_img=screen_img,
+                target_text=element_text,
+                expected_x=expected_x,
+                expected_y=expected_y,
+                search_radius=search_vicinity_radius
+            )
+            if ocr_res:
+                return ocr_res
 
         # === ШАР 3c: Gemini Vision API (останній резервний шар) ===
         if use_gemini and HAS_GEMINI and is_gemini_available():
@@ -510,9 +530,10 @@ class VisionMatcher:
         else:
             crop_img = screen_img
 
-        if HAS_RAPID_OCR and _rapid_ocr is not None and crop_img.size > 0:
+        ocr_engine = _get_rapid_ocr() if HAS_RAPID_OCR else None
+        if ocr_engine is not None and crop_img.size > 0:
             try:
-                results, _ = _rapid_ocr(crop_img)
+                results, _ = ocr_engine(crop_img)
                 if results:
                     detected = []
                     for box, text, score in results:

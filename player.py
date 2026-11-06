@@ -24,7 +24,7 @@ import cv2
 import winsound
 import pyperclip
 
-from models import WorkflowAction, Workflow
+from models import WorkflowAction, Workflow, get_key_display_name
 from vision_matcher import VisionMatcher
 from uia_manager import UIAManager
 
@@ -77,6 +77,7 @@ class ActionPlayer:
         
         self._thread: Optional[threading.Thread] = None
         self._keyboard_controller = pynput.keyboard.Controller()
+        self._mouse_controller = pynput.mouse.Controller()
 
     def play(
         self,
@@ -128,8 +129,14 @@ class ActionPlayer:
 
     def _start_esc_listener(self):
         def on_press(key):
-            if key == pynput.keyboard.Key.esc:
-                self.abort()
+            try:
+                from tray_and_hotkeys import HotkeysConfig, normalize_pynput_key
+                stop_hk = HotkeysConfig.instance().get("stop_playback") or "esc"
+                if normalize_pynput_key(key) == stop_hk:
+                    self.abort()
+            except Exception:
+                if key == pynput.keyboard.Key.esc:
+                    self.abort()
 
         self._esc_listener = pynput.keyboard.Listener(on_press=on_press)
         self._esc_listener.start()
@@ -297,7 +304,12 @@ class ActionPlayer:
                 lbl = action.uia_name or elem_text or action.uia_control_type or "елемент"
                 self.on_vision_status(f"⚡ UIA: пошук елемента \"{lbl}\"...")
 
-            uia_coords = UIAManager.find_element(locator, timeout=0.8)
+            uia_coords = UIAManager.find_element(
+                locator,
+                timeout=0.6,
+                expected_x=target_x,
+                expected_y=target_y
+            )
             if uia_coords:
                 ux, uy = uia_coords
                 if self.on_vision_status:
@@ -505,6 +517,27 @@ class ActionPlayer:
                 time.sleep(0.15)
                 return
 
+            # Виклик меню (правий клік миші без руху курсора, у точці де стоїть курсор)
+            is_right_menu_in_place = (
+                getattr(action, "click_at_cursor", False)
+                or action.type == "right_click"
+                or (action.type == "menu_click" and action.button == "right")
+            )
+            if is_right_menu_in_place:
+                btn_to_press = (
+                    pynput.mouse.Button.left if action.button == "left" and getattr(action, "click_at_cursor", False)
+                    else pynput.mouse.Button.right
+                )
+                cur_pos = self._mouse_controller.position
+                if self.on_vision_status:
+                    self.on_vision_status(f"🖱️ Меню: правий клік без руху курсора в поточній точці {cur_pos}")
+                try:
+                    self._mouse_controller.click(btn_to_press, 1)
+                except Exception:
+                    pyautogui.click(button="right" if btn_to_press == pynput.mouse.Button.right else "left")
+                time.sleep(0.15)
+                return
+
             click_x, click_y = self._resolve_click_coordinates(action)
 
             # Захист fail-safe
@@ -526,21 +559,129 @@ class ActionPlayer:
             time.sleep(0.08)
 
         elif action.type == "key_press":
-            self._type_key(action.key)
+            count = max(1, int(getattr(action, "key_press_count", 1) or 1))
+            cnt_info = f" (×{count})" if count > 1 else ""
+            if self.on_vision_status:
+                self.on_vision_status(f"⌨️ Натискання клавіші: {get_key_display_name(action.key)}{cnt_info}")
+            for i in range(count):
+                if self.abort_requested:
+                    break
+                self._type_key(action.key)
+                if i < count - 1:
+                    time.sleep(max(0.04, 0.08 / max(0.5, self.speed_factor)))
+            time.sleep(0.06)
         elif action.type == "delay":
             pass
+
+    def _resolve_pynput_key(self, token: str):
+        """Перетворює текстову назву клавіші у об'єкт pynput Key або KeyCode."""
+        k = token.strip().lower()
+        Key = pynput.keyboard.Key
+        special_map = {
+            "menu": Key.menu,
+            "apps": Key.menu,
+            "context_menu": Key.menu,
+            "up": Key.up,
+            "down": Key.down,
+            "left": Key.left,
+            "right": Key.right,
+            "enter": Key.enter,
+            "return": Key.enter,
+            "space": Key.space,
+            "tab": Key.tab,
+            "esc": Key.esc,
+            "escape": Key.esc,
+            "backspace": Key.backspace,
+            "delete": Key.delete,
+            "home": Key.home,
+            "end": Key.end,
+            "page_up": Key.page_up,
+            "pageup": Key.page_up,
+            "page_down": Key.page_down,
+            "pagedown": Key.page_down,
+            "insert": Key.insert,
+            "ctrl": Key.ctrl,
+            "ctrl_l": Key.ctrl_l,
+            "ctrl_r": Key.ctrl_r,
+            "shift": Key.shift,
+            "shift_l": Key.shift_l,
+            "shift_r": Key.shift_r,
+            "alt": Key.alt,
+            "alt_l": Key.alt_l,
+            "alt_r": Key.alt_r,
+        }
+        if k in special_map:
+            return special_map[k]
+        if k.startswith("f") and k[1:].isdigit():
+            f_attr = getattr(Key, k, None)
+            if f_attr is not None:
+                return f_attr
+        if k.startswith("vk_") and k[3:].isdigit():
+            return pynput.keyboard.KeyCode.from_vk(int(k[3:]))
+        if len(k) == 1 and ("a" <= k <= "z" or "0" <= k <= "9"):
+            # Використовуємо апаратний Virtual Key код (напр. VK_P = 0x50),
+            # щоб Ctrl+P / гарячі клавіші працювали незалежно від української чи англійської розкладки!
+            return pynput.keyboard.KeyCode.from_vk(ord(k.upper()))
+        if len(k) == 1:
+            return k
+        return getattr(Key, k, None)
 
     def _type_key(self, key_str: Optional[str]):
         if not key_str:
             return
-            
+
+        # Виправлення керівних символів (наприклад, '\x10' -> 'ctrl+p')
+        if len(key_str) == 1 and 1 <= ord(key_str) <= 26:
+            lower = f"ctrl+{chr(ord(key_str) + 96)}"
+            raw = lower
+        else:
+            raw = key_str.strip()
+            lower = raw.lower()
+
+        # Підтримка комбінацій клавіш (наприклад, 'ctrl+p', 'shift+f10', 'ctrl+s', 'alt+f4')
+        if "+" in lower and len(lower) > 1:
+            parts = [p.strip() for p in lower.split("+") if p.strip()]
+            resolved = [self._resolve_pynput_key(p) for p in parts]
+            if all(r is not None for r in resolved):
+                try:
+                    modifiers = resolved[:-1]
+                    main_key = resolved[-1]
+                    for m in modifiers:
+                        self._keyboard_controller.press(m)
+                    time.sleep(0.03)
+                    self._keyboard_controller.press(main_key)
+                    time.sleep(0.04)
+                    self._keyboard_controller.release(main_key)
+                    time.sleep(0.02)
+                    for m in reversed(modifiers):
+                        self._keyboard_controller.release(m)
+                    return
+                except Exception as e:
+                    logger.debug(f"Помилка натискання комбінації {raw}: {e}")
+
+        # Одинична клавіша (зокрема Key.menu, стрілки ↑↓←→, Enter тощо)
+        target_key = self._resolve_pynput_key(lower)
+        if target_key is not None:
+            try:
+                self._keyboard_controller.press(target_key)
+                time.sleep(0.03)
+                self._keyboard_controller.release(target_key)
+                return
+            except Exception as e:
+                logger.debug(f"pynput press failed for {raw}: {e}")
+
+        # Резервний шлях через pyautogui
         key_map = {
+            "menu": "apps",
+            "apps": "apps",
             "enter": "enter",
+            "return": "enter",
             "tab": "tab",
             "space": "space",
             "backspace": "backspace",
             "delete": "delete",
             "esc": "esc",
+            "escape": "esc",
             "up": "up",
             "down": "down",
             "left": "left",
@@ -554,19 +695,12 @@ class ActionPlayer:
             "end": "end",
             "home": "home",
             "pageup": "pageup",
+            "page_up": "pageup",
             "pagedown": "pagedown",
+            "page_down": "pagedown",
         }
-        
-        mapped = key_map.get(key_str.lower())
-        if mapped:
+        mapped = key_map.get(lower, lower)
+        try:
             pyautogui.press(mapped)
-        elif len(key_str) == 1:
-            try:
-                self._keyboard_controller.type(key_str)
-            except Exception:
-                pyautogui.write(key_str)
-        else:
-            try:
-                pyautogui.press(key_str)
-            except Exception:
-                pass
+        except Exception:
+            pass

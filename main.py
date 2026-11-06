@@ -7,6 +7,15 @@ import sys
 import os
 import traceback
 
+# Фіксуємо робочу директорію проєкту незалежно від способу запуску (start.bat / ярлик / IDE)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+try:
+    os.chdir(BASE_DIR)
+except Exception:
+    pass
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
 # Безпечне перенаправлення для pythonw (коли stdout/stderr рівні None)
 if sys.stdout is None:
     try:

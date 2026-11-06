@@ -3,12 +3,14 @@
 та редактор параметрів дій (з підтримкою Smart Vision).
 """
 import base64
+import time
+import ctypes
 import threading
 import cv2
 import numpy as np
 import customtkinter as ctk
-from typing import Callable, Optional, Tuple
-from models import WorkflowAction
+from typing import Callable, Optional, Tuple, List
+from models import WorkflowAction, get_key_display_name
 from region_selector import ScreenRegionSelector
 from pynput import keyboard as pynput_keyboard
 
@@ -28,6 +30,10 @@ except ImportError:
 
 
 class CheckpointModalDialog(ctk.CTkToplevel):
+    """
+    Компактне горизонтальне напівпрозоре вікно очікування ("Точка перевірки")
+    у лівому верхньому куті екрана (+15+15), щоб не перекривати робочу область.
+    """
     def __init__(
         self,
         master,
@@ -40,125 +46,170 @@ class CheckpointModalDialog(ctk.CTkToplevel):
         self.action = action
         self.on_response = on_response
         self.responded = False
+        self._drag_start_x = 0
+        self._drag_start_y = 0
+
+        try:
+            from tray_and_hotkeys import HotkeysConfig
+            hk = HotkeysConfig.instance()
+            self.cp_hotkey = hk.get("checkpoint") or "f8"
+            self.stop_hotkey = hk.get("stop_playback") or "esc"
+        except Exception:
+            self.cp_hotkey = "f8"
+            self.stop_hotkey = "esc"
         
-        self.title("Точка схвалення дії")
-        self.geometry("520x330")
-        self.resizable(False, False)
-        
-        self.attributes("-topmost", True)
-        self.lift()
-        self.focus_force()
-        self.grab_set()
-        
+        # Прямокутна горизонтальна форма зліва вгорі (+15+15)
+        w = 660
+        h = 84
+        self.title("Точка перевірки")
+        self.geometry(f"{w}x{h}+15+15")
         self.update_idletasks()
-        sw = self.winfo_screenwidth()
-        sh = self.winfo_screenheight()
-        w = 520
-        h = 330
-        x = (sw - w) // 2
-        y = (sh - h) // 2
-        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        try:
+            self.attributes("-alpha", 0.86)
+        except Exception:
+            pass
 
-        frame = ctk.CTkFrame(self, corner_radius=12, fg_color=("#f8fafc", "#0f172a"))
-        frame.pack(fill="both", expand=True, padx=12, pady=12)
+        frame = ctk.CTkFrame(
+            self,
+            width=w - 4,
+            height=h - 4,
+            corner_radius=10,
+            fg_color=("#0f172a", "#090d16"),
+            border_width=2,
+            border_color="#f59e0b"
+        )
+        frame.pack_propagate(False)
+        frame.pack(fill="both", expand=True, padx=2, pady=2)
+        frame.bind("<ButtonPress-1>", self._start_drag)
+        frame.bind("<B1-Motion>", self._on_drag)
 
-        lbl_cycle = ctk.CTkLabel(
-            frame,
-            text=f"📌 {cycle_info}",
+        # Ліва частина: заголовок, інфо циклу та текст повідомлення
+        left_box = ctk.CTkFrame(frame, fg_color="transparent")
+        left_box.pack(side="left", fill="both", expand=True, padx=(12, 6), pady=6)
+        left_box.bind("<ButtonPress-1>", self._start_drag)
+        left_box.bind("<B1-Motion>", self._on_drag)
+
+        title_str = action.title or "Точка перевірки"
+        lbl_top = ctk.CTkLabel(
+            left_box,
+            text=f"⏸️ {title_str}   •   📌 {cycle_info}",
             font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-            text_color="#3b82f6"
+            text_color="#fbbf24",
+            anchor="w"
         )
-        lbl_cycle.pack(anchor="w", padx=20, pady=(15, 5))
+        lbl_top.pack(fill="x", anchor="w", pady=(2, 2))
+        lbl_top.bind("<ButtonPress-1>", self._start_drag)
+        lbl_top.bind("<B1-Motion>", self._on_drag)
 
-        lbl_title = ctk.CTkLabel(
-            frame,
-            text=f"⏸️  {action.title or 'Підтвердження користувача'}",
-            font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"),
-            text_color=("#1e293b", "#f8fafc")
+        msg_text = (action.message or "Перевірте дані на екрані та підтвердіть продовження.").replace("\n", " ")
+        if len(msg_text) > 72:
+            msg_text = msg_text[:69] + "..."
+        lbl_msg = ctk.CTkLabel(
+            left_box,
+            text=msg_text,
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            text_color="#e2e8f0",
+            anchor="w"
         )
-        lbl_title.pack(anchor="w", padx=20, pady=(0, 10))
-
-        self.msg_box = ctk.CTkTextbox(
-            frame,
-            height=90,
-            font=ctk.CTkFont(family="Segoe UI", size=14),
-            wrap="word",
-            activate_scrollbars=False,
-            fg_color=("#e2e8f0", "#1e293b"),
-            text_color=("#0f172a", "#f1f5f9")
-        )
-        self.msg_box.pack(fill="x", padx=20, pady=5)
-        self.msg_box.insert("1.0", action.message or "Перевірте дані на екрані та підтвердіть готовність продовжувати.")
-        self.msg_box.configure(state="disabled")
+        lbl_msg.pack(fill="x", anchor="w")
+        lbl_msg.bind("<ButtonPress-1>", self._start_drag)
+        lbl_msg.bind("<B1-Motion>", self._on_drag)
 
         lbl_hint = ctk.CTkLabel(
-            frame,
-            text="💡 Натисніть F8 або кнопку нижче для продовження. Esc — зупинити все.",
-            font=ctk.CTkFont(family="Segoe UI", size=11),
-            text_color="#64748b"
+            left_box,
+            text=f"💡 [{self.cp_hotkey.upper()}] — продовжити  |  [{self.stop_hotkey.upper()}] — зупинити  (можна перетягувати мишею)",
+            font=ctk.CTkFont(family="Segoe UI", size=10),
+            text_color="#94a3b8",
+            anchor="w"
         )
-        lbl_hint.pack(anchor="w", padx=20, pady=(6, 12))
+        lbl_hint.pack(fill="x", anchor="w", pady=(1, 0))
+        lbl_hint.bind("<ButtonPress-1>", self._start_drag)
+        lbl_hint.bind("<B1-Motion>", self._on_drag)
 
+        # Права частина: компактні кнопки дії по горизонталі
         btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=20, pady=(0, 10))
+        btn_frame.pack(side="right", padx=(4, 10), pady=8)
 
-        self.btn_abort = ctk.CTkButton(
+        self.btn_continue = ctk.CTkButton(
             btn_frame,
-            text="⏹ Зупинити (Esc)",
-            font=ctk.CTkFont(family="Segoe UI", size=13),
-            fg_color="#dc2626",
-            hover_color="#b91c1c",
-            width=130,
-            height=40,
-            corner_radius=8,
-            command=lambda: self._respond("abort")
+            text=f"✅ Далі ({self.cp_hotkey.upper()})",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            fg_color="#10b981",
+            hover_color="#059669",
+            text_color="#ffffff",
+            width=112,
+            height=32,
+            corner_radius=6,
+            command=lambda: self._respond("continue")
         )
-        self.btn_abort.pack(side="left")
+        self.btn_continue.pack(side="left", padx=3)
 
         self.btn_skip = ctk.CTkButton(
             btn_frame,
             text="⏩ Пропустити",
-            font=ctk.CTkFont(family="Segoe UI", size=13),
-            fg_color="#475569",
-            hover_color="#64748b",
-            width=110,
-            height=40,
-            corner_radius=8,
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            fg_color="#334155",
+            hover_color="#475569",
+            width=92,
+            height=32,
+            corner_radius=6,
             command=lambda: self._respond("skip")
         )
-        self.btn_skip.pack(side="left", padx=10)
+        self.btn_skip.pack(side="left", padx=3)
 
-        self.btn_continue = ctk.CTkButton(
+        self.btn_abort = ctk.CTkButton(
             btn_frame,
-            text="✅ Продовжити (F8)",
-            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
-            fg_color="#10b981",
-            hover_color="#059669",
-            text_color="#ffffff",
-            height=40,
-            corner_radius=8,
-            command=lambda: self._respond("continue")
+            text=f"⏹ Стоп ({self.stop_hotkey.upper()})",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+            fg_color="#dc2626",
+            hover_color="#b91c1c",
+            width=90,
+            height=32,
+            corner_radius=6,
+            command=lambda: self._respond("abort")
         )
-        self.btn_continue.pack(side="right", fill="x", expand=True)
+        self.btn_abort.pack(side="left", padx=3)
 
         self.bind("<space>", lambda e: self._respond("continue"))
         self.bind("<Escape>", lambda e: self._respond("abort"))
         self.protocol("WM_DELETE_WINDOW", lambda: self._respond("abort"))
 
-        # F8 — глобальний перехоп через pynput (так само, як працює запис сценарію)
+        self.update_idletasks()
+        self.geometry(f"{w}x{h}+15+15")
+        self.lift()
+
+        # Глобальний перехоп гарячої клавіші через pynput
         self._kb_listener = None
         self._start_f8_listener()
 
+    def _start_drag(self, event):
+        self._drag_start_x = event.x
+        self._drag_start_y = event.y
+
+    def _on_drag(self, event):
+        x = self.winfo_x() + (event.x - self._drag_start_x)
+        y = self.winfo_y() + (event.y - self._drag_start_y)
+        self.geometry(f"+{x}+{y}")
+
     def _start_f8_listener(self):
-        """Запускає pynput listener для F8 — глобальне перехоплення клавіши незалежно від фокусу."""
+        """Запускає pynput listener для глобального перехоплення клавіші продовження або зупинки."""
         def on_press(key):
             if not self.responded:
                 try:
+                    from tray_and_hotkeys import normalize_pynput_key
+                    norm = normalize_pynput_key(key)
+                    if norm == self.cp_hotkey:
+                        self.after(0, lambda: self._respond("continue"))
+                        return False
+                    elif norm == self.stop_hotkey:
+                        self.after(0, lambda: self._respond("abort"))
+                        return False
+                except Exception:
                     if key == pynput_keyboard.Key.f8:
                         self.after(0, lambda: self._respond("continue"))
-                        return False  # зупиняємо listener
-                except Exception:
-                    pass
+                        return False
 
         self._kb_listener = pynput_keyboard.Listener(on_press=on_press)
         self._kb_listener.daemon = True
@@ -172,14 +223,12 @@ class CheckpointModalDialog(ctk.CTkToplevel):
         if self.responded:
             return
         self.responded = True
-        # Зупиняємо pynput listener
         try:
             if self._kb_listener and self._kb_listener.is_alive():
                 self._kb_listener.stop()
         except Exception:
             pass
         try:
-            self.grab_release()
             self.destroy()
         except Exception:
             pass
@@ -224,6 +273,8 @@ class ActionConfigDialog(ctk.CTkToplevel):
         self.template_b64 = self.action.template_b64
         self.template_width = self.action.template_width
         self.template_height = self.action.template_height
+        self.selected_key = self.action.key or "down"
+        self.key_press_count = max(1, int(getattr(self.action, "key_press_count", 1) or 1))
 
         self.title("Додати дію" if is_new else "Налаштування кроку сценарію")
         self.geometry("640x720")
@@ -255,7 +306,12 @@ class ActionConfigDialog(ctk.CTkToplevel):
 
         self.action_types = [
             "🔲 Вибір області (клік / фокус)",
-            "🔘 Клік по елементу (кнопка / меню)",
+            "🔘 Клік по елементу (кнопка / пункт меню)",
+            "🖱️ Меню (правий клік без руху курсора)",
+            "📋 Клавіша 'Меню' (контекстне меню з клавіатури)",
+            "⌨️ Клавіша клавіатури (стрілки ↑↓←→, Enter, Ctrl+P, Alt+F4)",
+            "🖨️ Друк документу (Ctrl+P)",
+            "❌ Закрити вікно (Alt+F4)",
             "📁 Вибір документу (2 області пошуку)",
             "🛑 Очікування підтвердження",
             "📜 Прокрутка до самого низу"
@@ -319,19 +375,44 @@ class ActionConfigDialog(ctk.CTkToplevel):
         btn_save.pack(side="right", fill="x", expand=True, padx=(10, 0))
 
         # Визначаємо початковий тип дії
+        self.protocol("WM_DELETE_WINDOW", self._on_dialog_wm_close)
         self._init_current_type()
+
+    def _on_dialog_wm_close(self):
+        """Якщо під час відкритого конструктора натиснуто Alt+F4 — не закриваємо вікно, а обираємо Alt+F4."""
+        try:
+            alt_down = bool(ctypes.windll.user32.GetAsyncKeyState(0x12) & 0x8000)
+            f4_down = bool(ctypes.windll.user32.GetAsyncKeyState(0x73) & 0x8000)
+            if alt_down or f4_down:
+                self._set_captured_key("alt+f4")
+                return
+        except Exception:
+            pass
+        self.destroy()
 
     def _init_current_type(self):
         if self.action.type == "scroll_to_bottom" or getattr(self.action, "scroll_to_bottom", False):
+            self.combo_type.set(self.action_types[9])
+        elif self.action.type == "key_press" and (self.action.key or "").lower() == "ctrl+p":
+            self.combo_type.set(self.action_types[5])
+        elif self.action.type == "key_press" and (self.action.key or "").lower() == "alt+f4":
+            self.combo_type.set(self.action_types[6])
+        elif self.action.type == "key_press" and (self.action.key or "").lower() in ("menu", "apps", "context_menu", "shift+f10"):
+            self.combo_type.set(self.action_types[3])
+        elif self.action.type == "key_press":
             self.combo_type.set(self.action_types[4])
+        elif getattr(self.action, "click_at_cursor", False) or self.action.type == "right_click" or (
+            self.action.type == "menu_click" and self.action.button == "right"
+        ):
+            self.combo_type.set(self.action_types[2])
         elif self.action.type == "area_click" or self.action.target_type == "area":
             self.combo_type.set(self.action_types[0])
-        elif self.action.type in ("click", "double_click", "right_click", "menu_click") and self.action.target_type in ("element", "menu_item", "button"):
+        elif self.action.type in ("click", "double_click", "menu_click") and self.action.target_type in ("element", "menu_item", "button"):
             self.combo_type.set(self.action_types[1])
         elif self.action.type == "file_selection" or self.action.target_type == "file_item" or self.action.show_file_menu:
-            self.combo_type.set(self.action_types[2])
+            self.combo_type.set(self.action_types[7])
         elif self.action.type == "checkpoint":
-            self.combo_type.set(self.action_types[3])
+            self.combo_type.set(self.action_types[8])
         else:
             self.combo_type.set(self.action_types[0])
         self._render_dynamic_fields()
@@ -468,6 +549,247 @@ class ActionConfigDialog(ctk.CTkToplevel):
             if getattr(self.action, "use_vision", True):
                 self.chk_use_vision.select()
             self.chk_use_vision.pack(anchor="w", padx=14, pady=4)
+
+            # Чекбокс кліку без руху курсора
+            self.chk_click_at_cursor = ctk.CTkCheckBox(
+                self.dynamic_frame,
+                text="Натиснути мишу без руху курсора (у поточній позиції курсора)",
+                font=ctk.CTkFont(size=12),
+                text_color="#fcd34d",
+                onvalue=True,
+                offvalue=False
+            )
+            if getattr(self.action, "click_at_cursor", False) or self.action.button == "right":
+                self.chk_click_at_cursor.select()
+            self.chk_click_at_cursor.pack(anchor="w", padx=14, pady=4)
+
+        # ============================================================
+        # 2b. МЕНЮ (ПРАВИЙ КЛІК МИШІ БЕЗ РУХУ КУРСОРА)
+        # ============================================================
+        elif "Меню (правий клік" in choice:
+            lbl_info = ctk.CTkLabel(
+                self.dynamic_frame,
+                text="🖱️ Виклик контекстного меню (ПКМ) у поточній точці курсора:\n\n"
+                     "• Курсор миші НЕ переміщується до старих координат.\n"
+                     "• Права кнопка миші натискається точно там, куди ви поставили курсор\n"
+                     "  (наприклад, після вибору потрібного рядка на точці перевірки).",
+                font=ctk.CTkFont(size=12),
+                text_color="#fcd34d",
+                justify="left"
+            )
+            lbl_info.pack(anchor="w", padx=14, pady=16)
+
+        # ============================================================
+        # 2c. КЛАВІША 'МЕНЮ' (КОНТЕКСТНЕ МЕНЮ З КЛАВІАТУРИ)
+        # ============================================================
+        elif "Клавіша 'Меню'" in choice:
+            lbl_info = ctk.CTkLabel(
+                self.dynamic_frame,
+                text="📋 Виклик контекстного меню за допомогою кнопки клавіатури 'Меню' (VK_APPS):\n\n"
+                     "• Відкриває контекстне меню для поточного виділеного рядка або елемента.\n"
+                     "• Після відкриття меню ви можете однозначно переміщуватися по пунктах\n"
+                     "  за допомогою стрілок ⬆️ ⬇️ ⬅️ ➡️ та підтверджувати вибір клавішею ⏎ Enter.",
+                font=ctk.CTkFont(size=12),
+                text_color="#38bdf8",
+                justify="left"
+            )
+            lbl_info.pack(anchor="w", padx=14, pady=(12, 10))
+
+            lbl_mode = ctk.CTkLabel(
+                self.dynamic_frame,
+                text="Спосіб виклику меню з клавіатури:",
+                font=ctk.CTkFont(size=12, weight="bold")
+            )
+            lbl_mode.pack(anchor="w", padx=14, pady=(4, 2))
+
+            self.menu_key_options = [
+                "📋 Клавіша 'Контекстне меню' (Menu / Apps / VK_APPS)",
+                "📋 Комбінація Shift + F10 (альтернативний виклик меню)"
+            ]
+            self.combo_menu_key = ctk.CTkComboBox(
+                self.dynamic_frame,
+                values=self.menu_key_options,
+                state="readonly",
+                height=32
+            )
+            if (self.action.key or "").lower() == "shift+f10":
+                self.combo_menu_key.set(self.menu_key_options[1])
+            else:
+                self.combo_menu_key.set(self.menu_key_options[0])
+            self.combo_menu_key.pack(fill="x", padx=14, pady=(0, 12))
+
+        # ============================================================
+        # 2d. КЛАВІША КЛАВІАТУРИ (ІНТЕРАКТИВНИЙ ЗАХВАТ КЛАВІШІ)
+        # ============================================================
+        elif "Клавіша клавіатури" in choice:
+            lbl_info = ctk.CTkLabel(
+                self.dynamic_frame,
+                text="⌨️ Натискання будь-якої кнопки клавіатури (стрілки ⬆️⬇️⬅️➡️ для навігації по меню,\n"
+                     "⏎ Enter для вибору пункту, 📋 Меню, Tab, Space, F1..F12 тощо).",
+                font=ctk.CTkFont(size=12),
+                text_color="#94a3b8",
+                justify="left"
+            )
+            lbl_info.pack(anchor="w", padx=14, pady=(10, 8))
+
+            # Індикатор обраної клавіші
+            key_box = ctk.CTkFrame(
+                self.dynamic_frame,
+                fg_color="#1e1b4b",
+                border_width=2,
+                border_color="#6366f1",
+                corner_radius=8
+            )
+            key_box.pack(fill="x", padx=14, pady=6)
+
+            self.lbl_selected_key_display = ctk.CTkLabel(
+                key_box,
+                text=f"Обрана клавіша:  {get_key_display_name(self.selected_key)}",
+                font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+                text_color="#a5b4fc"
+            )
+            self.lbl_selected_key_display.pack(padx=12, pady=12)
+
+            # Кнопка відкриття інтерактивного вікна натискання клавіші
+            btn_capture_key = ctk.CTkButton(
+                self.dynamic_frame,
+                text="🎹 Натиснути клавішу (відкрити вікно розпізнавання кнопки)",
+                font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+                fg_color="#7c3aed",
+                hover_color="#6d28d9",
+                height=38,
+                command=self._open_key_capture_modal
+            )
+            btn_capture_key.pack(fill="x", padx=14, pady=(6, 8))
+
+            # Швидкі кнопки для навігації по меню без зайвих рухів
+            lbl_quick = ctk.CTkLabel(
+                self.dynamic_frame,
+                text="Або оберіть кнопкою для швидкої навігації по меню:",
+                font=ctk.CTkFont(size=11),
+                text_color="#cbd5e1"
+            )
+            lbl_quick.pack(anchor="w", padx=14, pady=(2, 4))
+
+            q_frame1 = ctk.CTkFrame(self.dynamic_frame, fg_color="transparent")
+            q_frame1.pack(fill="x", padx=14, pady=2)
+
+            quick_keys_row1 = [
+                ("⬆️ Вгору", "up", "#0284c7"),
+                ("⬇️ Вниз", "down", "#0284c7"),
+                ("⬅️ Вліво", "left", "#0284c7"),
+                ("➡️ Вправо", "right", "#0284c7"),
+                ("⏎ Enter", "enter", "#059669"),
+            ]
+            for title_k, code_k, col_k in quick_keys_row1:
+                b = ctk.CTkButton(
+                    q_frame1,
+                    text=title_k,
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                    fg_color=col_k,
+                    width=88,
+                    height=30,
+                    command=lambda c=code_k: self._set_captured_key(c)
+                )
+                b.pack(side="left", padx=3, pady=2, expand=True, fill="x")
+
+            q_frame2 = ctk.CTkFrame(self.dynamic_frame, fg_color="transparent")
+            q_frame2.pack(fill="x", padx=14, pady=(2, 8))
+
+            quick_keys_row2 = [
+                ("🖨️ Друк (Ctrl+P)", "ctrl+p", "#0d9488"),
+                ("❌ Закрити (Alt+F4)", "alt+f4", "#dc2626"),
+                ("📋 Клавіша 'Меню'", "menu", "#d97706"),
+                ("📋 Shift+F10", "shift+f10", "#b45309"),
+                ("⎋ Esc", "esc", "#475569"),
+            ]
+            for title_k, code_k, col_k in quick_keys_row2:
+                b = ctk.CTkButton(
+                    q_frame2,
+                    text=title_k,
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                    fg_color=col_k,
+                    width=88,
+                    height=30,
+                    command=lambda c=code_k: self._set_captured_key(c)
+                )
+                b.pack(side="left", padx=3, pady=2, expand=True, fill="x")
+
+            # Налаштування кількості натискань даної клавіші
+            count_frame = ctk.CTkFrame(self.dynamic_frame, fg_color="#0f172a", corner_radius=8)
+            count_frame.pack(fill="x", padx=14, pady=(6, 10))
+
+            lbl_cnt = ctk.CTkLabel(
+                count_frame,
+                text="🔢 Кількість натискань цієї кнопки поспіль:",
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color="#e2e8f0"
+            )
+            lbl_cnt.pack(side="left", padx=12, pady=8)
+
+            btn_cnt_plus = ctk.CTkButton(
+                count_frame,
+                text="+",
+                width=32,
+                height=28,
+                font=ctk.CTkFont(size=14, weight="bold"),
+                fg_color="#334155",
+                hover_color="#475569",
+                command=lambda: self._step_key_count(+1)
+            )
+            btn_cnt_plus.pack(side="right", padx=(4, 12), pady=6)
+
+            self.entry_key_count = ctk.CTkEntry(
+                count_frame,
+                width=58,
+                height=28,
+                font=ctk.CTkFont(family="Consolas", size=13, weight="bold"),
+                justify="center"
+            )
+            self.entry_key_count.insert(0, str(self.key_press_count))
+            self.entry_key_count.pack(side="right", padx=2, pady=6)
+
+            btn_cnt_minus = ctk.CTkButton(
+                count_frame,
+                text="−",
+                width=32,
+                height=28,
+                font=ctk.CTkFont(size=14, weight="bold"),
+                fg_color="#334155",
+                hover_color="#475569",
+                command=lambda: self._step_key_count(-1)
+            )
+            btn_cnt_minus.pack(side="right", padx=4, pady=6)
+
+        # ============================================================
+        # 2e. ДРУК ДОКУМЕНТУ (CTRL+P)
+        # ============================================================
+        elif "Друк документу (Ctrl+P)" in choice:
+            lbl_info = ctk.CTkLabel(
+                self.dynamic_frame,
+                text="🖨️ Викликає системне або програмне вікно друку комбінацією клавіш Ctrl + P.\n"
+                     "✅ Працює на апаратному рівні клавіш Windows (VK_CONTROL + VK_P) і не залежить\n"
+                     "від того, яка мова розкладки (Українська чи Англійська) увімкнена в системі!",
+                font=ctk.CTkFont(size=12),
+                text_color="#34d399",
+                justify="left"
+            )
+            lbl_info.pack(anchor="w", padx=14, pady=(14, 14))
+
+        # ============================================================
+        # 2f. ЗАКРИТИ ВІКНО (ALT+F4)
+        # ============================================================
+        elif "Закрити вікно (Alt+F4)" in choice:
+            lbl_info = ctk.CTkLabel(
+                self.dynamic_frame,
+                text="❌ Закриває поточне активне вікно (наприклад, відкритий PDF-документ після друку)\n"
+                     "системною комбінацією клавіш Alt + F4.\n"
+                     "✅ Натискається автоматично під час виконання сценарію.",
+                font=ctk.CTkFont(size=12),
+                text_color="#f87171",
+                justify="left"
+            )
+            lbl_info.pack(anchor="w", padx=14, pady=(14, 14))
 
         # ============================================================
         # 3. ВИБІР ДОКУМЕНТУ (2 ОБЛАСТІ ПОШУКУ З ПРІОРИТЕТОМ)
@@ -730,6 +1052,58 @@ class ActionConfigDialog(ctk.CTkToplevel):
                     )
         self._run_snip(f"Протягніть Область {area_num} для пошуку документів", on_done)
 
+    def _step_key_count(self, delta: int):
+        try:
+            curr = int(self.entry_key_count.get().strip())
+        except Exception:
+            curr = self.key_press_count
+        new_cnt = max(1, min(999, curr + delta))
+        self.key_press_count = new_cnt
+        if hasattr(self, "entry_key_count") and self.entry_key_count.winfo_exists():
+            self.entry_key_count.delete(0, "end")
+            self.entry_key_count.insert(0, str(new_cnt))
+
+    def _set_captured_key(self, key_code: str, count: Optional[int] = None):
+        self.selected_key = key_code
+        self.action.key = key_code
+        if count is not None and count >= 1:
+            self.key_press_count = count
+            if hasattr(self, "entry_key_count") and self.entry_key_count.winfo_exists():
+                self.entry_key_count.delete(0, "end")
+                self.entry_key_count.insert(0, str(count))
+        if hasattr(self, "lbl_selected_key_display") and self.lbl_selected_key_display.winfo_exists():
+            cnt_info = f"  [×{self.key_press_count}]" if self.key_press_count > 1 else ""
+            self.lbl_selected_key_display.configure(
+                text=f"Обрана клавіша:  {get_key_display_name(key_code)}{cnt_info}",
+                text_color="#4ade80"
+            )
+
+    def _open_key_capture_modal(self):
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "entry_key_count") and self.entry_key_count.winfo_exists():
+                self.key_press_count = max(1, int(self.entry_key_count.get().strip()))
+        except Exception:
+            pass
+
+        def on_captured_with_count(k_code: str, k_count: int):
+            try:
+                self.grab_set()
+            except Exception:
+                pass
+            self._set_captured_key(k_code, k_count)
+
+        KeyCaptureDialog(
+            self,
+            initial_key=self.selected_key,
+            initial_count=self.key_press_count,
+            show_count=True,
+            on_captured_with_count=on_captured_with_count
+        )
+
     # ============================================================
     # ЗБЕРЕЖЕННЯ ПАРАМЕТРІВ
     # ============================================================
@@ -753,18 +1127,22 @@ class ActionConfigDialog(ctk.CTkToplevel):
 
         elif "Клік по елементу" in choice:
             btn_choice = self.combo_btn.get()
+            at_cursor = bool(self.chk_click_at_cursor.get()) if hasattr(self, "chk_click_at_cursor") else False
             if "Правий" in btn_choice:
                 self.action.type = "menu_click"
                 self.action.target_type = "menu_item"
                 self.action.button = "right"
+                self.action.click_at_cursor = True if not hasattr(self, "chk_click_at_cursor") else at_cursor
             elif "Подвійний" in btn_choice:
                 self.action.type = "double_click"
                 self.action.target_type = "element"
                 self.action.button = "left"
+                self.action.click_at_cursor = at_cursor
             else:
                 self.action.type = "click"
                 self.action.target_type = "element"
                 self.action.button = "left"
+                self.action.click_at_cursor = at_cursor
 
             if hasattr(self, "entry_element_text"):
                 text_val = self.entry_element_text.get().strip()
@@ -772,12 +1150,78 @@ class ActionConfigDialog(ctk.CTkToplevel):
                 if not self.action.uia_name and text_val:
                     self.action.uia_name = text_val
             if hasattr(self, "chk_use_vision"):
-                self.action.use_vision = bool(self.chk_use_vision.get())
+                self.action.use_vision = bool(self.chk_use_vision.get()) and not self.action.click_at_cursor
 
-            if self.template_b64:
+            if self.template_b64 and not self.action.click_at_cursor:
                 self.action.template_b64 = self.template_b64
                 self.action.template_width = self.template_width
                 self.action.template_height = self.template_height
+
+        elif "Меню (правий клік" in choice:
+            self.action.type = "menu_click"
+            self.action.target_type = "menu_item"
+            self.action.button = "right"
+            self.action.click_at_cursor = True
+            self.action.use_vision = False
+            self.action.template_b64 = None
+            self.action.area_rect_1 = None
+            self.action.area_rect_2 = None
+            if not self.action.comment or self.action.comment in ("Клік по області списку", "Пункт меню: 'пункт меню'"):
+                self.action.comment = "Виклик меню (правий клік без руху курсора)"
+
+        elif "Клавіша 'Меню'" in choice:
+            self.action.type = "key_press"
+            self.action.target_type = "menu_item"
+            m_choice = self.combo_menu_key.get() if hasattr(self, "combo_menu_key") else ""
+            self.action.key = "shift+f10" if "Shift" in m_choice else "menu"
+            self.action.use_vision = False
+            self.action.template_b64 = None
+            self.action.area_rect_1 = None
+            self.action.area_rect_2 = None
+            if not self.action.comment or self.action.comment == "Клік по області списку":
+                self.action.comment = get_key_display_name(self.action.key)
+
+        elif "Клавіша клавіатури" in choice:
+            self.action.type = "key_press"
+            self.action.target_type = "element"
+            self.action.key = self.selected_key or "down"
+            try:
+                cnt_val = int(self.entry_key_count.get().strip()) if hasattr(self, "entry_key_count") else self.key_press_count
+                self.action.key_press_count = max(1, min(999, cnt_val))
+            except Exception:
+                self.action.key_press_count = max(1, self.key_press_count)
+            self.action.use_vision = False
+            self.action.template_b64 = None
+            self.action.area_rect_1 = None
+            self.action.area_rect_2 = None
+            base_name = get_key_display_name(self.action.key)
+            cnt_suffix = f" (×{self.action.key_press_count})" if self.action.key_press_count > 1 else ""
+            if not self.action.comment or self.action.comment == "Клік по області списку" or self.action.comment.startswith(base_name):
+                self.action.comment = f"{base_name}{cnt_suffix}"
+
+        elif "Друк документу (Ctrl+P)" in choice:
+            self.action.type = "key_press"
+            self.action.target_type = "element"
+            self.action.key = "ctrl+p"
+            self.action.key_press_count = 1
+            self.action.use_vision = False
+            self.action.template_b64 = None
+            self.action.area_rect_1 = None
+            self.action.area_rect_2 = None
+            if not self.action.comment or self.action.comment == "Клік по області списку":
+                self.action.comment = "Виклик вікна друку (Ctrl+P)"
+
+        elif "Закрити вікно (Alt+F4)" in choice:
+            self.action.type = "key_press"
+            self.action.target_type = "element"
+            self.action.key = "alt+f4"
+            self.action.key_press_count = 1
+            self.action.use_vision = False
+            self.action.template_b64 = None
+            self.action.area_rect_1 = None
+            self.action.area_rect_2 = None
+            if not self.action.comment or self.action.comment == "Клік по області списку":
+                self.action.comment = "Закрити активне вікно (Alt+F4)"
 
         elif "Вибір документу" in choice:
             self.action.type = "file_selection"
@@ -1456,4 +1900,567 @@ class AppendActionsDialog(ctk.CTkToplevel):
             self.destroy()
         except Exception:
             pass
+
+
+class KeyCaptureDialog(ctk.CTkToplevel):
+    """
+    Інтерактивне вікно, у якому користувач просто натискає потрібну кнопку
+    на фізичній клавіатурі (стрілки ↑↓←→, Enter, Контекстне меню, F1..F12 тощо),
+    або обирає кнопку 'Контекстне меню' одним кліком.
+    """
+    def __init__(
+        self,
+        master,
+        initial_key: str = "down",
+        on_captured: Optional[Callable[[str], None]] = None,
+        initial_count: int = 1,
+        show_count: bool = False,
+        on_captured_with_count: Optional[Callable[[str, int], None]] = None
+    ):
+        super().__init__(master)
+        self.captured_key = initial_key or "down"
+        self.captured_count = max(1, int(initial_count or 1))
+        self.show_count = show_count
+        self.on_captured = on_captured
+        self.on_captured_with_count = on_captured_with_count
+        self.responded = False
+        self._kb_listener: Optional[pynput_keyboard.Listener] = None
+
+        win_h = 490 if show_count else 430
+        self.title("Натисніть клавішу клавіатури")
+        self.geometry(f"540x{win_h}")
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+        self.grab_set()
+
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = (sw - 540) // 2
+        y = (sh - win_h) // 2
+        self.geometry(f"540x{win_h}+{x}+{y}")
+
+        # Заголовок
+        header = ctk.CTkFrame(self, fg_color="#312e81", corner_radius=8)
+        header.pack(fill="x", padx=16, pady=(16, 10))
+
+        lbl_title = ctk.CTkLabel(
+            header,
+            text="🎹 Натисніть потрібну клавішу на клавіатурі",
+            font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
+            text_color="#e0e7ff"
+        )
+        lbl_title.pack(anchor="w", padx=14, pady=(10, 2))
+
+        lbl_sub = ctk.CTkLabel(
+            header,
+            text="Натисніть будь-яку кнопку на фізичній клавіатурі (стрілки ↑↓←→, Enter, Меню тощо),\n"
+                 "і вона автоматично відобразиться у полі нижче:",
+            font=ctk.CTkFont(size=11),
+            text_color="#c7d2fe",
+            justify="left"
+        )
+        lbl_sub.pack(anchor="w", padx=14, pady=(0, 10))
+
+        # Велике табло перехопленої клавіші
+        self.capture_box = ctk.CTkFrame(
+            self,
+            fg_color="#0f172a",
+            border_width=2,
+            border_color="#38bdf8",
+            corner_radius=10
+        )
+        self.capture_box.pack(fill="x", padx=16, pady=8)
+
+        self.lbl_key_big = ctk.CTkLabel(
+            self.capture_box,
+            text=get_key_display_name(self.captured_key),
+            font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"),
+            text_color="#38bdf8"
+        )
+        self.lbl_key_big.pack(padx=16, pady=(16, 4))
+
+        self.lbl_key_code = ctk.CTkLabel(
+            self.capture_box,
+            text=f"Код клавіші: '{self.captured_key}'  (очікування натискання з клавіатури...)",
+            font=ctk.CTkFont(size=11),
+            text_color="#94a3b8"
+        )
+        self.lbl_key_code.pack(padx=16, pady=(0, 14))
+
+        # Панель швидких кнопок (якщо зручніше клікнути мишкою або немає фізичної клавіші Menu)
+        quick_box = ctk.CTkFrame(self, fg_color=("#1e293b", "#0f172a"), corner_radius=8)
+        quick_box.pack(fill="x", padx=16, pady=6)
+
+        lbl_q = ctk.CTkLabel(
+            quick_box,
+            text="Швидкий вибір кнопок керування меню:",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#cbd5e1"
+        )
+        lbl_q.pack(anchor="w", padx=12, pady=(8, 4))
+
+        row1 = ctk.CTkFrame(quick_box, fg_color="transparent")
+        row1.pack(fill="x", padx=10, pady=2)
+        for txt, code, col in [
+            ("🖨️ Друк (Ctrl+P)", "ctrl+p", "#0d9488"),
+            ("❌ Закрити (Alt+F4)", "alt+f4", "#dc2626"),
+            ("📋 Клавіша 'Меню'", "menu", "#d97706"),
+            ("📋 Shift+F10", "shift+f10", "#b45309"),
+            ("⏎ Enter", "enter", "#059669"),
+        ]:
+            ctk.CTkButton(
+                row1,
+                text=txt,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                fg_color=col,
+                height=30,
+                command=lambda c=code: self._on_key_set(c)
+            ).pack(side="left", padx=3, pady=2, expand=True, fill="x")
+
+        row2 = ctk.CTkFrame(quick_box, fg_color="transparent")
+        row2.pack(fill="x", padx=10, pady=(2, 10))
+        for txt, code in [
+            ("⬆️ Вгору", "up"),
+            ("⬇️ Вниз", "down"),
+            ("⬅️ Вліво", "left"),
+            ("➡️ Вправо", "right"),
+            ("⎋ Esc", "esc"),
+        ]:
+            ctk.CTkButton(
+                row2,
+                text=txt,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                fg_color="#0284c7",
+                height=30,
+                width=80,
+                command=lambda c=code: self._on_key_set(c)
+            ).pack(side="left", padx=3, pady=2, expand=True, fill="x")
+
+        # Блок вибору кількості натискань кнопки (для кроку сценарію)
+        self.entry_count = None
+        if self.show_count:
+            count_box = ctk.CTkFrame(self, fg_color="#0f172a", corner_radius=8)
+            count_box.pack(fill="x", padx=16, pady=(2, 4))
+
+            lbl_cnt = ctk.CTkLabel(
+                count_box,
+                text="🔢 Кількість натискань:",
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color="#e2e8f0"
+            )
+            lbl_cnt.pack(side="left", padx=(12, 6), pady=8)
+
+            ctk.CTkButton(
+                count_box,
+                text="−",
+                width=28,
+                height=26,
+                font=ctk.CTkFont(size=13, weight="bold"),
+                fg_color="#334155",
+                hover_color="#475569",
+                command=lambda: self._adjust_count(-1)
+            ).pack(side="left", padx=2, pady=6)
+
+            self.entry_count = ctk.CTkEntry(
+                count_box,
+                width=48,
+                height=26,
+                font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+                justify="center"
+            )
+            self.entry_count.insert(0, str(self.captured_count))
+            self.entry_count.pack(side="left", padx=2, pady=6)
+
+            ctk.CTkButton(
+                count_box,
+                text="+",
+                width=28,
+                height=26,
+                font=ctk.CTkFont(size=13, weight="bold"),
+                fg_color="#334155",
+                hover_color="#475569",
+                command=lambda: self._adjust_count(+1)
+            ).pack(side="left", padx=2, pady=6)
+
+            for preset in (1, 2, 3, 4, 5):
+                ctk.CTkButton(
+                    count_box,
+                    text=f"×{preset}",
+                    width=34,
+                    height=26,
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                    fg_color="#1e3a8a" if preset > 1 else "#334155",
+                    hover_color="#2563eb",
+                    command=lambda p=preset: self._set_count_preset(p)
+                ).pack(side="left", padx=2, pady=6)
+
+        # Нижні кнопки підтвердження
+        btn_bar = ctk.CTkFrame(self, fg_color="transparent")
+        btn_bar.pack(fill="x", padx=16, pady=(10, 14))
+
+        btn_cancel = ctk.CTkButton(
+            btn_bar,
+            text="Скасувати",
+            font=ctk.CTkFont(size=12),
+            fg_color="#475569",
+            hover_color="#64748b",
+            width=110,
+            height=36,
+            command=self._cancel
+        )
+        btn_cancel.pack(side="left")
+
+        btn_ok = ctk.CTkButton(
+            btn_bar,
+            text="✔ Використати цю клавішу",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#10b981",
+            hover_color="#059669",
+            height=36,
+            command=self._confirm
+        )
+        btn_ok.pack(side="right", fill="x", expand=True, padx=(10, 0))
+
+        self._last_alt_f4_ts: float = 0.0
+        self.protocol("WM_DELETE_WINDOW", self._on_wm_delete_window)
+        self.bind("<Alt-F4>", self._on_tk_alt_f4)
+        self.bind("<Alt-KeyPress-F4>", self._on_tk_alt_f4)
+        self._start_listener()
+
+    def _on_tk_alt_f4(self, event=None):
+        """Перехоплює комбінацію Alt+F4 на рівні Tkinter, щоб вікно не закривалося."""
+        self._last_alt_f4_ts = time.time()
+        self._on_key_set("alt+f4")
+        return "break"
+
+    def _on_wm_delete_window(self):
+        """
+        Коли користувач натискає Alt+F4 на клавіатурі, Windows надсилає вікну WM_CLOSE.
+        Перехоплюємо це повідомлення: якщо затиснуто Alt або F4 (або щойно спрацював Alt+F4),
+        НЕ закриваємо діалог, а встановлюємо комбінацію 'alt+f4'!
+        """
+        try:
+            alt_down = bool(ctypes.windll.user32.GetAsyncKeyState(0x12) & 0x8000)
+            f4_down = bool(ctypes.windll.user32.GetAsyncKeyState(0x73) & 0x8000)
+        except Exception:
+            alt_down = False
+            f4_down = False
+
+        if (
+            alt_down
+            or f4_down
+            or "alt" in getattr(self, "_held_modifiers", set())
+            or (time.time() - getattr(self, "_last_alt_f4_ts", 0.0) < 1.0)
+        ):
+            self._last_alt_f4_ts = time.time()
+            self._on_key_set("alt+f4")
+            return
+        self._cancel()
+
+    def _adjust_count(self, delta: int):
+        if self.entry_count is None:
+            return
+        try:
+            curr = int(self.entry_count.get().strip())
+        except Exception:
+            curr = self.captured_count
+        self._set_count_preset(max(1, min(999, curr + delta)))
+
+    def _set_count_preset(self, val: int):
+        self.captured_count = max(1, min(999, int(val)))
+        if self.entry_count is not None and self.entry_count.winfo_exists():
+            self.entry_count.delete(0, "end")
+            self.entry_count.insert(0, str(self.captured_count))
+        self.focus_set()
+
+    def _start_listener(self):
+        self._held_modifiers = set()
+
+        def on_press(key):
+            if self.responded:
+                return
+            try:
+                if self.entry_count is not None and self.focus_get() == getattr(self.entry_count, "_entry", None):
+                    return
+            except Exception:
+                pass
+            key_code = self._normalize_pynput_key(key)
+            if not key_code:
+                return
+            if key_code in ("ctrl", "shift", "alt"):
+                self._held_modifiers.add(key_code)
+                return
+            if self._held_modifiers:
+                mods = [m for m in ("ctrl", "alt", "shift") if m in self._held_modifiers]
+                combo = "+".join(mods + [key_code])
+                if combo == "alt+f4":
+                    self._last_alt_f4_ts = time.time()
+                self.after(0, lambda c=combo: self._on_key_set(c))
+            else:
+                self.after(0, lambda c=key_code: self._on_key_set(c))
+
+        def on_release(key):
+            if self.responded:
+                return
+            key_code = self._normalize_pynput_key(key)
+            if key_code in ("ctrl", "shift", "alt"):
+                self._held_modifiers.discard(key_code)
+
+        try:
+            self._kb_listener = pynput_keyboard.Listener(on_press=on_press, on_release=on_release)
+            self._kb_listener.daemon = True
+            self._kb_listener.start()
+        except Exception:
+            pass
+
+    def _stop_listener(self):
+        if self._kb_listener:
+            try:
+                self._kb_listener.stop()
+            except Exception:
+                pass
+            self._kb_listener = None
+
+    @staticmethod
+    def _normalize_pynput_key(key) -> str:
+        try:
+            from tray_and_hotkeys import normalize_pynput_key
+            return normalize_pynput_key(key)
+        except Exception:
+            if isinstance(key, pynput_keyboard.Key):
+                name = (key.name or "").lower()
+                for s in ("_l", "_r", "_gr"):
+                    if name.endswith(s):
+                        name = name[:-len(s)]
+                return name
+            elif isinstance(key, pynput_keyboard.KeyCode):
+                if key.vk == 93:
+                    return "menu"
+                if key.vk and 65 <= key.vk <= 90:
+                    return chr(key.vk).lower()
+                if key.char and len(key.char) == 1 and 1 <= ord(key.char) <= 26:
+                    return chr(ord(key.char) + 96)
+                if key.char:
+                    return key.char.lower()
+                if key.vk:
+                    return f"vk_{key.vk}"
+            return str(key)
+
+    def _on_key_set(self, key_code: str):
+        if self.responded:
+            return
+        self.captured_key = key_code
+        try:
+            self.capture_box.configure(border_color="#4ade80")
+            self.lbl_key_big.configure(
+                text=get_key_display_name(key_code),
+                text_color="#4ade80"
+            )
+            self.lbl_key_code.configure(
+                text=f"✅ Натиснуто клавішу: '{key_code}' — натисніть '✔ Використати цю клавішу'",
+                text_color="#cbd5e1"
+            )
+        except Exception:
+            pass
+
+    def _confirm(self):
+        if self.responded:
+            return
+        self.responded = True
+        if self.entry_count is not None:
+            try:
+                self.captured_count = max(1, min(999, int(self.entry_count.get().strip())))
+            except Exception:
+                pass
+        self._stop_listener()
+        try:
+            self.grab_release()
+            self.destroy()
+        except Exception:
+            pass
+        if self.on_captured_with_count:
+            self.on_captured_with_count(self.captured_key, self.captured_count)
+        elif self.on_captured:
+            self.on_captured(self.captured_key)
+
+    def _cancel(self):
+        if self.responded:
+            return
+        self.responded = True
+        self._stop_listener()
+        try:
+            self.grab_release()
+            self.destroy()
+        except Exception:
+            pass
+        try:
+            if self.master and self.master.winfo_exists():
+                self.master.grab_set()
+        except Exception:
+            pass
+
+
+class HotkeysSettingsDialog(ctk.CTkToplevel):
+    """
+    Вікно налаштування всіх гарячих клавіш застосунку (Старт, Стоп, Запис, Точка перевірки, Пауза, Трей).
+    """
+    def __init__(self, master, on_saved: Optional[Callable[[], None]] = None):
+        super().__init__(master)
+        self.on_saved = on_saved
+        self.title("⌨️ Налаштування гарячих клавіш")
+        self.geometry("650x500")
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+        self.grab_set()
+        self.lift()
+        self.focus_force()
+
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = (sw - 650) // 2
+        y = (sh - 500) // 2
+        self.geometry(f"650x500+{x}+{y}")
+
+        from tray_and_hotkeys import HotkeysConfig, HOTKEY_DEFINITIONS
+        self.hk_config = HotkeysConfig.instance()
+        self.definitions = HOTKEY_DEFINITIONS
+        self.temp_keys = dict(self.hk_config.hotkeys)
+        self.lbl_badges = {}
+
+        container = ctk.CTkFrame(self, corner_radius=10, fg_color=("#0f172a", "#090d16"))
+        container.pack(fill="both", expand=True, padx=10, pady=10)
+
+        lbl_title = ctk.CTkLabel(
+            container,
+            text="⌨️ Налаштування гарячих клавіш програми",
+            font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
+            text_color="#38bdf8"
+        )
+        lbl_title.pack(anchor="w", padx=16, pady=(12, 2))
+
+        lbl_sub = ctk.CTkLabel(
+            container,
+            text="Гаряча клавіша Старту перехоплюється глобально, навіть коли програму згорнуто в трей біля годинника.",
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            text_color="#94a3b8"
+        )
+        lbl_sub.pack(anchor="w", padx=16, pady=(0, 8))
+
+        rows_frame = ctk.CTkScrollableFrame(container, fg_color="#1e293b", corner_radius=8, height=320)
+        rows_frame.pack(fill="both", expand=True, padx=14, pady=4)
+
+        for action_id, desc_text, default_key in self.definitions:
+            row = ctk.CTkFrame(rows_frame, fg_color="#0f172a", corner_radius=6)
+            row.pack(fill="x", padx=4, pady=4)
+
+            lbl_desc = ctk.CTkLabel(
+                row,
+                text=desc_text,
+                font=ctk.CTkFont(family="Segoe UI", size=12),
+                text_color="#f1f5f9",
+                anchor="w"
+            )
+            lbl_desc.pack(side="left", padx=(12, 6), pady=8, fill="x", expand=True)
+
+            btn_change = ctk.CTkButton(
+                row,
+                text="🎹 Змінити...",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                fg_color="#2563eb",
+                hover_color="#1d4ed8",
+                width=95,
+                height=26,
+                corner_radius=5,
+                command=lambda aid=action_id: self._capture_for_action(aid)
+            )
+            btn_change.pack(side="right", padx=(4, 10), pady=6)
+
+            curr_key = self.temp_keys.get(action_id, default_key)
+            lbl_badge = ctk.CTkLabel(
+                row,
+                text=f"[{curr_key.upper()}]",
+                font=ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+                fg_color="#1e3a8a",
+                text_color="#93c5fd",
+                corner_radius=5,
+                width=90,
+                height=26
+            )
+            lbl_badge.pack(side="right", padx=4, pady=6)
+            self.lbl_badges[action_id] = lbl_badge
+
+        # Нижні кнопки
+        bottom = ctk.CTkFrame(container, fg_color="transparent")
+        bottom.pack(fill="x", padx=14, pady=(8, 10))
+
+        btn_reset = ctk.CTkButton(
+            bottom,
+            text="🔄 За замовчуванням",
+            font=ctk.CTkFont(size=12),
+            fg_color="#334155",
+            hover_color="#475569",
+            width=150,
+            height=34,
+            command=self._reset_defaults
+        )
+        btn_reset.pack(side="left")
+
+        btn_cancel = ctk.CTkButton(
+            bottom,
+            text="✖ Скасувати",
+            font=ctk.CTkFont(size=12),
+            fg_color="#475569",
+            hover_color="#334155",
+            width=110,
+            height=34,
+            command=self.destroy
+        )
+        btn_cancel.pack(side="right", padx=(6, 0))
+
+        btn_save = ctk.CTkButton(
+            bottom,
+            text="💾 Зберегти гарячі клавіші",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#10b981",
+            hover_color="#059669",
+            width=190,
+            height=34,
+            command=self._save
+        )
+        btn_save.pack(side="right")
+
+    def _capture_for_action(self, action_id: str):
+        curr = self.temp_keys.get(action_id, "f6")
+
+        def on_key_picked(new_key: str):
+            norm = (new_key or "").strip().lower()
+            if norm:
+                self.temp_keys[action_id] = norm
+                if action_id in self.lbl_badges:
+                    self.lbl_badges[action_id].configure(text=f"[{norm.upper()}]", text_color="#4ade80")
+
+        KeyCaptureDialog(self, initial_key=curr, on_captured=on_key_picked)
+
+    def _reset_defaults(self):
+        for action_id, _, default_key in self.definitions:
+            self.temp_keys[action_id] = default_key
+            if action_id in self.lbl_badges:
+                self.lbl_badges[action_id].configure(text=f"[{default_key.upper()}]", text_color="#93c5fd")
+
+    def _save(self):
+        for k, v in self.temp_keys.items():
+            self.hk_config.set(k, v)
+        self.hk_config.save()
+        try:
+            self.grab_release()
+            self.destroy()
+        except Exception:
+            pass
+        if self.on_saved:
+            self.on_saved()
+
+
+
 

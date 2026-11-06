@@ -8,6 +8,58 @@ from typing import List, Dict, Any, Optional, Tuple
 import json
 import time
 
+KEY_DISPLAY_NAMES: Dict[str, str] = {
+    "ctrl+p": "🖨️ Друк документу (Ctrl+P)",
+    "ctrl+s": "💾 Зберегти (Ctrl+S)",
+    "ctrl+c": "📋 Копіювати (Ctrl+C)",
+    "ctrl+v": "📋 Вставити (Ctrl+V)",
+    "ctrl+a": "☑️ Виділити все (Ctrl+A)",
+    "alt+f4": "🚪 Закрити вікно (Alt+F4)",
+    "menu": "📋 Контекстне меню (клавіша Menu / VK_APPS)",
+    "apps": "📋 Контекстне меню (клавіша Menu / VK_APPS)",
+    "shift+f10": "📋 Контекстне меню (Shift+F10)",
+    "up": "⬆️ Стрілка ВГОРУ (Up)",
+    "down": "⬇️ Стрілка ВНИЗ (Down)",
+    "left": "⬅️ Стрілка ВЛІВО (Left)",
+    "right": "➡️ Стрілка ВПРАВО (Right)",
+    "enter": "⏎ Підтвердити / Вибрати (Enter)",
+    "return": "⏎ Підтвердити / Вибрати (Enter)",
+    "space": "␣ Пробіл (Space)",
+    "tab": "⇥ Табуляція (Tab)",
+    "esc": "⎋ Скасувати / Закрити меню (Esc)",
+    "escape": "⎋ Скасувати / Закрити меню (Esc)",
+    "backspace": "⌫ Backspace",
+    "delete": "🗑️ Видалити (Delete)",
+    "home": "🏠 На початок (Home)",
+    "end": "🔚 До кінця (End)",
+    "page_up": "📄⬆️ Page Up",
+    "pageup": "📄⬆️ Page Up",
+    "page_down": "📄⬇️ Page Down",
+    "pagedown": "📄⬇️ Page Down",
+}
+
+def normalize_stored_key_code(key_str: Optional[str]) -> str:
+    """Виправляє керівні ASCII-символи (наприклад, '\\x10' від Ctrl+P) на читабельну комбінацію 'ctrl+p'."""
+    if not key_str:
+        return ""
+    if len(key_str) == 1 and 1 <= ord(key_str) <= 26:
+        return f"ctrl+{chr(ord(key_str) + 96)}"
+    return key_str.strip().lower()
+
+def get_key_display_name(key_str: Optional[str]) -> str:
+    """Повертає зрозумілу назву клавіші або комбінації для інтерфейсу користувача."""
+    if not key_str:
+        return "не обрано"
+    k = normalize_stored_key_code(key_str)
+    if k in KEY_DISPLAY_NAMES:
+        return KEY_DISPLAY_NAMES[k]
+    if "+" in k:
+        parts = [p.strip().upper() for p in k.split("+") if p.strip()]
+        return f"⌨️ Комбінація {' + '.join(parts)}"
+    if k.startswith("f") and k[1:].isdigit():
+        return f"🎛️ Функціональна клавіша {k.upper()}"
+    return f"⌨️ Клавіша '{k.upper()}'"
+
 @dataclass
 class WorkflowAction:
     type: str  # 'click', 'double_click', 'right_click', 'area_click', 'menu_click', 'scroll_to_bottom', 'file_selection', 'key_press', 'checkpoint', 'delay'
@@ -33,6 +85,7 @@ class WorkflowAction:
     x: Optional[int] = None
     y: Optional[int] = None
     button: Optional[str] = "left"  # 'left', 'right', 'middle'
+    click_at_cursor: bool = False   # Натиснути кнопку миші у поточній позиції курсора без руху миші
     
     # Прокрутка списку
     scroll_amount: Optional[int] = None     # Кількість кроків прокрутки (від'ємне = вниз)
@@ -61,7 +114,8 @@ class WorkflowAction:
     template_bank: List[str] = field(default_factory=list)
     
     # Для клавіатури
-    key: Optional[str] = None  # назва клавіші, наприклад 'enter', 'tab', 'ctrl', тощо.
+    key: Optional[str] = None               # назва клавіші, наприклад 'enter', 'tab', 'down', 'menu' тощо
+    key_press_count: int = 1                # кількість послідовних натискань цієї клавіші за один крок
     
     # Для точки зупинки/схвалення (Checkpoint)
     title: Optional[str] = "Підтвердження користувача"
@@ -87,6 +141,8 @@ class WorkflowAction:
             filtered["area_rect_1"] = tuple(filtered["area_rect_1"])
         if "area_rect_2" in filtered and filtered["area_rect_2"] is not None:
             filtered["area_rect_2"] = tuple(filtered["area_rect_2"])
+        if "key" in filtered and filtered["key"]:
+            filtered["key"] = normalize_stored_key_code(filtered["key"])
         return cls(**filtered)
 
     def add_to_bank(self, new_template_b64: str):
@@ -125,6 +181,8 @@ class WorkflowAction:
             else:
                 area_info = ""
             return f"📁 Пошук та вибір файлу{text_info}{area_info}{menu_info} {delay_str}"
+        elif self.click_at_cursor or self.type == "right_click" or (self.type == "menu_click" and self.button == "right"):
+            return f"🖱️ Меню (правий клік на місці курсора без руху) {delay_str}"
         elif self.type == "menu_click" or self.target_type == "menu_item":
             return f"📋 Пункт меню{text_info} на ({self.x}, {self.y}){badge_str} {delay_str}"
         elif self.type == "click":
@@ -132,10 +190,10 @@ class WorkflowAction:
             return f"🔘 {btn_name}{text_info} на ({self.x}, {self.y}){badge_str} {delay_str}"
         elif self.type == "double_click":
             return f"🖱️🖱️ Подвійний клік{text_info} на ({self.x}, {self.y}){badge_str} {delay_str}"
-        elif self.type == "right_click":
-            return f"🖱️ Контекстне меню (правий клік){text_info} на ({self.x}, {self.y}){badge_str} {delay_str}"
         elif self.type == "key_press":
-            return f"⌨️ Клавіша: '{self.key}' {delay_str}"
+            cnt = max(1, int(getattr(self, "key_press_count", 1) or 1))
+            cnt_str = f" [×{cnt} раз(и)]" if cnt > 1 else ""
+            return f"{get_key_display_name(self.key)}{cnt_str} {delay_str}"
         elif self.type == "delay":
             return f"⏳ Пауза / Очікування {self.delay_before:.2f} сек"
         return f"Дія: {self.type} {delay_str}"

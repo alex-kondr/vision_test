@@ -6,12 +6,16 @@
 """
 import os
 import sys
+import json
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import customtkinter as ctk
 from typing import Optional, List
 
-from models import Workflow, WorkflowAction
+APP_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_state.json")
+LAST_SESSION_WORKFLOW_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_session_workflow.json")
+
+from models import Workflow, WorkflowAction, get_key_display_name
 from recorder import ActionRecorder
 from player import ActionPlayer
 from floating_bar import FloatingRecordingBar
@@ -21,8 +25,12 @@ from dialogs import (
     FileSelectionContextMenu,
     AddActionDialog,
     RetrainChunkDialog,
-    AppendActionsDialog
+    AppendActionsDialog,
+    KeyCaptureDialog,
+    HotkeysSettingsDialog
 )
+from tray_and_hotkeys import HotkeysConfig, WindowsTrayManager, normalize_pynput_key
+from pynput import keyboard as pynput_keyboard
 
 try:
     from gemini_vision import set_api_key, is_gemini_available
@@ -35,13 +43,433 @@ ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
 
+class InteractiveActionTable(ctk.CTkFrame):
+    """
+    Інтерактивна таблиця кроків сценарію з кнопками [-] та [+] (крок 0.05с)
+    і полем ручного вводу точного часу виконання біля кожної дії справа.
+    Повністю сумісна з інтерфейсом ttk.Treeview.
+    """
+    TAG_COLORS = {
+        "checkpoint": ("#451a03", "#fde68a"),
+        "click": ("#1e293b", "#e2e8f0"),
+        "area": ("#1e293b", "#38bdf8"),
+        "scroll": ("#1e293b", "#a78bfa"),
+        "file": ("#1e293b", "#34d399"),
+        "menu": ("#1e293b", "#fcd34d"),
+        "key": ("#1e293b", "#cbd5e1"),
+        "delay": ("#1e293b", "#94a3b8"),
+        "running": ("#1e3a8a", "#ffffff"),
+        "": ("#1e293b", "#f8fafc"),
+    }
+
+    def __init__(self, master, on_delay_changed=None, on_key_count_changed=None, **kwargs):
+        super().__init__(master, fg_color="#1e293b", corner_radius=6, **kwargs)
+        self.on_delay_changed = on_delay_changed
+        self.on_key_count_changed = on_key_count_changed
+        self._rows = {}  # iid -> dict
+        self._order = []
+        self._selected_iid: Optional[str] = None
+        self._dbl_click_cb = None
+        self._right_click_cb = None
+        self._delete_cb = None
+
+        # Заголовок таблиці
+        header = tk.Frame(self, bg="#0f172a", height=28)
+        header.pack(fill="x", side="top")
+
+        tk.Label(header, text="№", width=4, bg="#0f172a", fg="#93c5fd", font=("Segoe UI", 10, "bold")).pack(side="left", padx=(4, 2), pady=4)
+        tk.Label(header, text="Тип дії", width=19, anchor="w", bg="#0f172a", fg="#93c5fd", font=("Segoe UI", 10, "bold")).pack(side="left", padx=4, pady=4)
+        tk.Label(header, text="Деталі / Повідомлення", anchor="w", bg="#0f172a", fg="#93c5fd", font=("Segoe UI", 10, "bold")).pack(side="left", fill="x", expand=True, padx=4, pady=4)
+        tk.Label(header, text="Час виконання (с)", width=18, anchor="center", bg="#0f172a", fg="#93c5fd", font=("Segoe UI", 10, "bold")).pack(side="right", padx=(4, 18), pady=4)
+        tk.Label(header, text="Vision / Натискань", width=17, anchor="center", bg="#0f172a", fg="#93c5fd", font=("Segoe UI", 10, "bold")).pack(side="right", padx=4, pady=4)
+
+        # Прокручувана область рядків
+        body = tk.Frame(self, bg="#1e293b")
+        body.pack(fill="both", expand=True)
+
+        self.canvas = tk.Canvas(body, bg="#1e293b", highlightthickness=0, bd=0)
+        self.scrollbar = ttk.Scrollbar(body, orient="vertical", command=self.canvas.yview)
+        self.inner_frame = tk.Frame(self.canvas, bg="#1e293b")
+
+        self.inner_window = self.canvas.create_window((0, 0), window=self.inner_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+
+        self.inner_frame.bind("<Configure>", self._on_frame_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.bind("<Enter>", self._bind_mousewheel)
+        self.canvas.bind("<Leave>", self._unbind_mousewheel)
+
+    def _on_frame_configure(self, event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfig(self.inner_window, width=event.width)
+
+    def _bind_mousewheel(self, event=None):
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _unbind_mousewheel(self, event=None):
+        self.canvas.unbind_all("<MouseWheel>")
+
+    def _on_mousewheel(self, event):
+        try:
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        except Exception:
+            pass
+
+    # --- Сумісність з ttk.Treeview API ---
+    def heading(self, *args, **kwargs): pass
+    def column(self, *args, **kwargs): pass
+    def tag_configure(self, *args, **kwargs): pass
+
+    def bind(self, seq: str, func, add=None):
+        if seq == "<Double-1>":
+            self._dbl_click_cb = func
+        elif seq == "<Button-3>":
+            self._right_click_cb = func
+        elif seq == "<Delete>":
+            self._delete_cb = func
+            super().bind(seq, func)
+        else:
+            super().bind(seq, func)
+
+    def get_children(self):
+        return tuple(self._order)
+
+    def exists(self, iid: str) -> bool:
+        return str(iid) in self._rows
+
+    def delete(self, iid: str):
+        iid = str(iid)
+        info = self._rows.pop(iid, None)
+        if info:
+            try:
+                info["frame"].destroy()
+            except Exception:
+                pass
+        if iid in self._order:
+            self._order.remove(iid)
+        if self._selected_iid == iid:
+            self._selected_iid = None
+
+    def selection(self):
+        if self._selected_iid is not None and self._selected_iid in self._rows:
+            return (self._selected_iid,)
+        return ()
+
+    def selection_set(self, iid: str):
+        iid = str(iid)
+        prev = self._selected_iid
+        self._selected_iid = iid if iid in self._rows else None
+        if prev and prev in self._rows:
+            self._apply_row_colors(prev)
+        if self._selected_iid and self._selected_iid in self._rows:
+            self._apply_row_colors(self._selected_iid)
+
+    def see(self, iid: str):
+        iid = str(iid)
+        if iid not in self._rows or not self._order:
+            return
+        try:
+            idx = self._order.index(iid)
+            frac = max(0.0, min(1.0, idx / max(1, len(self._order))))
+            self.canvas.yview_moveto(frac)
+        except Exception:
+            pass
+
+    def identify_row(self, y: int) -> str:
+        return self._selected_iid or ""
+
+    def item(self, iid: str, option: Optional[str] = None, **kwargs):
+        iid = str(iid)
+        if iid not in self._rows:
+            return {}
+        info = self._rows[iid]
+        if "tags" in kwargs:
+            info["tags"] = list(kwargs["tags"])
+            self._apply_row_colors(iid)
+        if option == "tags":
+            return tuple(info["tags"])
+        return info
+
+    def insert(self, parent: str, index: str, iid: str, values: tuple, tags: tuple = ()):
+        iid = str(iid)
+        num_val, type_str, desc_str, vision_badge, delay_str = values
+        try:
+            raw_num = float(str(delay_str).replace("с", "").replace("s", "").replace(",", ".").strip())
+        except ValueError:
+            raw_num = 0.10
+
+        row_frame = tk.Frame(self.inner_frame, bg="#1e293b", height=30, bd=0, highlightthickness=1, highlightbackground="#0f172a")
+        row_frame.pack(fill="x", side="top", pady=0)
+
+        lbl_num = tk.Label(row_frame, text=str(num_val), width=4, anchor="center", font=("Segoe UI", 10))
+        lbl_num.pack(side="left", padx=(4, 2), pady=3)
+
+        lbl_type = tk.Label(row_frame, text=str(type_str), width=19, anchor="w", font=("Segoe UI", 10, "bold"))
+        lbl_type.pack(side="left", padx=4, pady=3)
+
+        lbl_desc = tk.Label(row_frame, text=str(desc_str), anchor="w", font=("Segoe UI", 10))
+        lbl_desc.pack(side="left", fill="x", expand=True, padx=4, pady=3)
+
+        # Правий блок: [-] [Entry (точне число)] [+] с
+        delay_box = tk.Frame(row_frame, bg="#1e293b")
+        delay_box.pack(side="right", padx=(4, 8), pady=2)
+
+        btn_minus = tk.Button(
+            delay_box,
+            text="−",
+            width=2,
+            bg="#334155",
+            fg="#f8fafc",
+            activebackground="#475569",
+            activeforeground="#ffffff",
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2",
+            command=lambda i=iid: self._step_delay(i, -0.05)
+        )
+        btn_minus.pack(side="left", padx=1)
+
+        var_delay = tk.StringVar(value=f"{raw_num:.2f}")
+        entry_delay = tk.Entry(
+            delay_box,
+            textvariable=var_delay,
+            width=6,
+            justify="center",
+            bg="#0f172a",
+            fg="#38bdf8",
+            insertbackground="#38bdf8",
+            relief="solid",
+            bd=1,
+            font=("Consolas", 10, "bold")
+        )
+        entry_delay.pack(side="left", padx=2)
+        entry_delay.bind("<Return>", lambda e, i=iid: self._commit_entry_delay(i))
+        entry_delay.bind("<FocusOut>", lambda e, i=iid: self._commit_entry_delay(i))
+
+        btn_plus = tk.Button(
+            delay_box,
+            text="+",
+            width=2,
+            bg="#334155",
+            fg="#f8fafc",
+            activebackground="#475569",
+            activeforeground="#ffffff",
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2",
+            command=lambda i=iid: self._step_delay(i, +0.05)
+        )
+        btn_plus.pack(side="left", padx=1)
+
+        lbl_sec = tk.Label(delay_box, text="с", font=("Segoe UI", 9), bg="#1e293b", fg="#94a3b8")
+        lbl_sec.pack(side="left", padx=(2, 0))
+
+        # Стовпець Vision або інтерактивний лічильник натискань для клавіатури
+        vb_str = str(vision_badge)
+        var_kcount = None
+        kcount_val = 1
+        if vb_str.startswith("KEY_COUNT:"):
+            try:
+                kcount_val = max(1, int(vb_str.split(":", 1)[1]))
+            except Exception:
+                kcount_val = 1
+
+            kbox = tk.Frame(row_frame, bg="#1e293b", width=130)
+            kbox.pack(side="right", padx=6, pady=2)
+
+            lbl_k = tk.Label(kbox, text="×", font=("Segoe UI", 9, "bold"), bg="#1e293b", fg="#a78bfa")
+            lbl_k.pack(side="left", padx=(0, 2))
+
+            btn_k_minus = tk.Button(
+                kbox,
+                text="−",
+                width=2,
+                bg="#334155",
+                fg="#f8fafc",
+                activebackground="#475569",
+                activeforeground="#ffffff",
+                relief="flat",
+                font=("Segoe UI", 9, "bold"),
+                cursor="hand2",
+                command=lambda i=iid: self._step_kcount(i, -1)
+            )
+            btn_k_minus.pack(side="left", padx=1)
+
+            var_kcount = tk.StringVar(value=str(kcount_val))
+            entry_kcount = tk.Entry(
+                kbox,
+                textvariable=var_kcount,
+                width=4,
+                justify="center",
+                bg="#0f172a",
+                fg="#c084fc",
+                insertbackground="#c084fc",
+                relief="solid",
+                bd=1,
+                font=("Consolas", 10, "bold")
+            )
+            entry_kcount.pack(side="left", padx=2)
+            entry_kcount.bind("<Return>", lambda e, i=iid: self._commit_entry_kcount(i))
+            entry_kcount.bind("<FocusOut>", lambda e, i=iid: self._commit_entry_kcount(i))
+
+            btn_k_plus = tk.Button(
+                kbox,
+                text="+",
+                width=2,
+                bg="#334155",
+                fg="#f8fafc",
+                activebackground="#475569",
+                activeforeground="#ffffff",
+                relief="flat",
+                font=("Segoe UI", 9, "bold"),
+                cursor="hand2",
+                command=lambda i=iid: self._step_kcount(i, +1)
+            )
+            btn_k_plus.pack(side="left", padx=1)
+
+            lbl_vision = kbox
+            extra_bg_widgets = (kbox, lbl_k)
+        else:
+            lbl_vision = tk.Label(row_frame, text=vb_str, width=17, anchor="center", font=("Segoe UI", 9))
+            lbl_vision.pack(side="right", padx=4, pady=3)
+            extra_bg_widgets = (lbl_vision,)
+
+        self._rows[iid] = {
+            "frame": row_frame,
+            "widgets": (row_frame, lbl_num, lbl_type, lbl_desc, *extra_bg_widgets, delay_box, lbl_sec),
+            "lbl_desc": lbl_desc,
+            "var_delay": var_delay,
+            "delay_val": raw_num,
+            "var_kcount": var_kcount,
+            "kcount_val": kcount_val,
+            "tags": list(tags),
+        }
+        self._order.append(iid)
+        self._apply_row_colors(iid)
+
+        # Прив'язка кліку, подвійного кліку та правого кліку
+        click_targets = [row_frame, lbl_num, lbl_type, lbl_desc]
+        if isinstance(lbl_vision, tk.Label):
+            click_targets.append(lbl_vision)
+        for w in click_targets:
+            w.bind("<Button-1>", lambda e, i=iid: self._on_row_click(e, i))
+            w.bind("<Double-1>", lambda e, i=iid: self._on_row_dbl_click(e, i))
+            w.bind("<Button-3>", lambda e, i=iid: self._on_row_right_click(e, i))
+
+    def _step_kcount(self, iid: str, delta: int):
+        if iid not in self._rows or self._rows[iid]["var_kcount"] is None:
+            return
+        info = self._rows[iid]
+        try:
+            curr = int(info["var_kcount"].get().strip())
+        except ValueError:
+            curr = info["kcount_val"]
+        new_val = max(1, min(999, curr + delta))
+        info["kcount_val"] = new_val
+        info["var_kcount"].set(str(new_val))
+        if self.on_key_count_changed:
+            try:
+                self.on_key_count_changed(int(iid), new_val)
+            except Exception:
+                pass
+
+    def _commit_entry_kcount(self, iid: str):
+        if iid not in self._rows or self._rows[iid]["var_kcount"] is None:
+            return
+        info = self._rows[iid]
+        try:
+            new_val = max(1, min(999, int(info["var_kcount"].get().strip())))
+        except ValueError:
+            new_val = info["kcount_val"]
+        info["kcount_val"] = new_val
+        info["var_kcount"].set(str(new_val))
+        if self.on_key_count_changed:
+            try:
+                self.on_key_count_changed(int(iid), new_val)
+            except Exception:
+                pass
+
+    def _step_delay(self, iid: str, delta: float):
+        if iid not in self._rows:
+            return
+        info = self._rows[iid]
+        try:
+            curr = float(info["var_delay"].get().replace(",", ".").strip())
+        except ValueError:
+            curr = info["delay_val"]
+        new_val = round(max(0.0, curr + delta), 2)
+        info["delay_val"] = new_val
+        info["var_delay"].set(f"{new_val:.2f}")
+        self._notify_delay_change(iid, new_val)
+
+    def _commit_entry_delay(self, iid: str):
+        if iid not in self._rows:
+            return
+        info = self._rows[iid]
+        raw = info["var_delay"].get().replace(",", ".").strip()
+        try:
+            new_val = round(max(0.0, float(raw)), 2)
+        except ValueError:
+            new_val = info["delay_val"]
+        info["delay_val"] = new_val
+        info["var_delay"].set(f"{new_val:.2f}")
+        self._notify_delay_change(iid, new_val)
+
+    def _notify_delay_change(self, iid: str, new_val: float):
+        if self.on_delay_changed:
+            try:
+                self.on_delay_changed(int(iid), new_val)
+            except Exception:
+                pass
+
+    def _on_row_click(self, event, iid: str):
+        self.selection_set(iid)
+        self.focus_set()
+
+    def _on_row_dbl_click(self, event, iid: str):
+        self.selection_set(iid)
+        if self._dbl_click_cb:
+            self._dbl_click_cb(event)
+
+    def _on_row_right_click(self, event, iid: str):
+        self.selection_set(iid)
+        if self._right_click_cb:
+            self._right_click_cb(event)
+
+    def _apply_row_colors(self, iid: str):
+        info = self._rows.get(iid)
+        if not info:
+            return
+        tags = info["tags"]
+        if "running" in tags:
+            bg, fg = self.TAG_COLORS["running"]
+        elif self._selected_iid == iid:
+            bg, fg = ("#2563eb", "#ffffff")
+        else:
+            tag = tags[0] if tags else ""
+            bg, fg = self.TAG_COLORS.get(tag, self.TAG_COLORS[""])
+
+        for w in info["widgets"]:
+            try:
+                w.configure(bg=bg)
+                if isinstance(w, tk.Label) and w is not info["widgets"][-1]:
+                    w.configure(fg=fg)
+            except Exception:
+                pass
+
+
 class AutoFlowApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
         self.title("AutoFlow Assistant — Автоматизація пошти та документів")
-        self.geometry("1120x780")
-        self.minsize(940, 680)
+        self.geometry("1020x700")
+        self.minsize(820, 560)
 
         # Об'єкти моделі, запису та відтворення
         self.workflow = Workflow(
@@ -54,10 +482,24 @@ class AutoFlowApp(ctk.CTk):
         # Лічильник навчань: кількість записів для поточного сценарію
         self._training_runs: int = 0
         self._append_insert_idx: Optional[int] = None
+        self._current_workflow_path: Optional[str] = None
+        self._loading_workflow: bool = True
         self._retrain_start_idx: int = 0
         self._retrain_end_idx: Optional[int] = None
 
         self.floating_bar: Optional[FloatingRecordingBar] = None
+        self._is_in_tray: bool = False
+        self.hk_config = HotkeysConfig.instance()
+
+        # Менеджер системного трею Windows (біля годинника)
+        self.tray_manager = WindowsTrayManager(
+            on_restore=lambda: self.after(0, self.restore_from_tray),
+            on_start=lambda: self.after(0, self.start_playback),
+            on_stop=lambda: self.after(0, self.stop_playback),
+            on_open_hotkeys=lambda: self.after(0, self._open_hotkeys_from_tray),
+            on_exit=lambda: self.after(0, self.quit_app),
+        )
+        self._global_kb_listener: Optional[pynput_keyboard.Listener] = None
 
         # Налаштування зворотних викликів (колбеків)
         self._setup_callbacks()
@@ -65,11 +507,16 @@ class AutoFlowApp(ctk.CTk):
         # Побудова графічного інтерфейсу
         self._build_ui()
 
+        # Завантажуємо останній використаний сценарій (або шаблон за замовчуванням)
+        self._load_default_template_if_exists()
+
         # Завантажуємо Gemini API ключ з .env / змінного середовища (якщо є)
         self._load_gemini_api_key()
+        self._loading_workflow = False
 
-        # Спробуємо завантажити шаблон за замовчуванням, якщо існує
-        self._load_default_template_if_exists()
+        # Запускаємо системний трей та глобальний перехоплювач гарячих клавіш
+        self._init_tray_and_global_hotkeys()
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
 
     def _setup_callbacks(self):
         # Колбеки записувача
@@ -77,6 +524,7 @@ class AutoFlowApp(ctk.CTk):
         self.recorder.on_checkpoint_added = self._on_recorder_checkpoint
         self.recorder.on_stop_requested = self._stop_recording_from_hotkey
         self.recorder.on_pause_toggled = self._on_recorder_pause_toggled
+        self.recorder.on_target_type_changed = self._on_recorder_target_type_changed
 
         # Колбеки програвача
         self.player.on_cycle_start = self._on_player_cycle_start
@@ -88,475 +536,526 @@ class AutoFlowApp(ctk.CTk):
         self.player.on_vision_status = self._on_vision_status
 
 
+    def _create_dropdown_menu(self) -> tk.Menu:
+        """Створює стилізоване випадаюче меню у стилі стандартних вікон Windows (темна тема)."""
+        return tk.Menu(
+            self,
+            tearoff=0,
+            bg="#0f172a",
+            fg="#f8fafc",
+            activebackground="#2563eb",
+            activeforeground="#ffffff",
+            selectcolor="#38bdf8",
+            relief="flat",
+            bd=1,
+            font=("Segoe UI", 10)
+        )
+
+    def _popup_menu_below(self, widget, menu: tk.Menu):
+        """Відкриває випадаюче меню рівно під натиснутою кнопкою верхньої панелі."""
+        try:
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty() + widget.winfo_height() + 1
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
     def _build_ui(self):
-        # 1. Верхній заголовок
-        header_frame = ctk.CTkFrame(self, corner_radius=10, fg_color=("#1e293b", "#0f172a"))
-        header_frame.pack(fill="x", padx=15, pady=(15, 8))
+        # Змінні синхронізації чекбоксів у меню та на панелі
+        self.var_smart_vision = tk.BooleanVar(value=True)
+        self.var_pause_cycle = tk.BooleanVar(value=True)
+        self._gemini_bar_visible = False
 
-        title_box = ctk.CTkFrame(header_frame, fg_color="transparent")
-        title_box.pack(side="left", padx=15, pady=10)
+        # =====================================================================
+        # 1. ВЕРХНЯ ПАНЕЛЬ МЕНЮ (як у стандартних вікнах Windows)
+        # =====================================================================
+        menubar_frame = ctk.CTkFrame(self, corner_radius=6, fg_color=("#0f172a", "#090d16"), height=32)
+        menubar_frame.pack(fill="x", padx=10, pady=(6, 2))
 
-        lbl_app_name = ctk.CTkLabel(
-            title_box,
-            text="⚡ AutoFlow Assistant  [Gemini Vision + Smart Vision]",
-            font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
-            text_color="#38bdf8"
-        )
-        lbl_app_name.pack(anchor="w")
+        # --- Побудова випадаючих меню ---
+        self._rebuild_top_menus()
 
-        lbl_subtitle = ctk.CTkLabel(
-            title_box,
-            text="Багаторазове навчання: кожен новий запис додає знімки Gemini Vision для кращого розпізнавання",
-            font=ctk.CTkFont(family="Segoe UI", size=12),
-            text_color="#94a3b8"
-        )
-        lbl_subtitle.pack(anchor="w")
+        # --- Кнопки категорій меню у верхній панелі ---
+        menu_btn_specs = [
+            ("📁 Файл ▾", "menu_file"),
+            ("⏺ Навчання ▾", "menu_record"),
+            ("▶️ Виконання ▾", "menu_play"),
+            ("➕ Додати дію ▾", "menu_add"),
+            ("✏️ Правка ▾", "menu_edit"),
+            ("⚙️ Налаштування ▾", "menu_settings"),
+        ]
+        for text, menu_attr in menu_btn_specs:
+            btn = ctk.CTkButton(
+                menubar_frame,
+                text=text,
+                font=ctk.CTkFont(family="Segoe UI", size=12),
+                fg_color="transparent",
+                hover_color="#1e293b",
+                text_color="#e2e8f0",
+                height=26,
+                width=82,
+                corner_radius=4
+            )
+            btn.configure(command=lambda b=btn, attr=menu_attr: self._popup_menu_below(b, getattr(self, attr)))
+            btn.pack(side="left", padx=2, pady=3)
 
-        # Статусний бейдж у правому кутку
+        # Справа у верхній панелі: статус, Gemini та лічильник навчань
         self.lbl_status_badge = ctk.CTkLabel(
-            header_frame,
-            text="🟢 Готовий до роботи",
-            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            menubar_frame,
+            text="🟢 Готовий",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
             fg_color="#1e3a8a",
             text_color="#93c5fd",
-            corner_radius=8,
-            padx=12,
-            pady=6
+            corner_radius=5,
+            padx=8,
+            pady=2
         )
-        self.lbl_status_badge.pack(side="right", padx=15, pady=15)
+        self.lbl_status_badge.pack(side="right", padx=(6, 8), pady=3)
 
-        # 2. Панель головних кнопок керування
-        controls_frame = ctk.CTkFrame(self, corner_radius=10)
-        controls_frame.pack(fill="x", padx=15, pady=5)
-
-        # Кнопка ЗАПИСАТИ (перший запис / повне перезаписування)
-        self.btn_record = ctk.CTkButton(
-            controls_frame,
-            text="⏺ Навчити",
-            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
-            fg_color="#ef4444",
-            hover_color="#dc2626",
-            height=38,
-            width=115,
-            corner_radius=8,
-            command=self.start_recording
-        )
-        self.btn_record.pack(side="left", padx=(12, 3), pady=8)
-
-        # Кнопка ДОЗАПИСАТИ ДІЇ (в кінець або після конкретного кроку)
-        self.btn_append = ctk.CTkButton(
-            controls_frame,
-            text="⏺➕ Дозапис",
-            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
-            fg_color="#dc2626",
-            hover_color="#b91c1c",
-            height=38,
-            width=115,
-            corner_radius=8,
-            command=self.open_append_recording_dialog
-        )
-        self.btn_append.pack(side="left", padx=3, pady=8)
-
-        # Кнопка ДОНАВЧАННЯ (повторне навчання з точки / шматками)
-        self.btn_retrain = ctk.CTkButton(
-            controls_frame,
-            text="🧠 Донавчання",
-            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
-            fg_color="#7c3aed",
-            hover_color="#6d28d9",
-            height=38,
-            width=125,
-            corner_radius=8,
-            command=self.open_retrain_chunk_dialog
-        )
-        self.btn_retrain.pack(side="left", padx=3, pady=8)
-
-        # Лічильник навчань 
         self.lbl_training_runs = ctk.CTkLabel(
-            controls_frame,
+            menubar_frame,
             text="📚 0 навч.",
             font=ctk.CTkFont(family="Segoe UI", size=11),
-            text_color="#a78bfa",
-            width=58
+            text_color="#a78bfa"
         )
-        self.lbl_training_runs.pack(side="left", padx=(0, 4))
+        self.lbl_training_runs.pack(side="right", padx=6, pady=3)
 
-        sep0 = ctk.CTkFrame(controls_frame, width=2, height=34, fg_color="#334155")
-        sep0.pack(side="left", padx=6, pady=8)
+        self.lbl_gemini_status = ctk.CTkLabel(
+            menubar_frame,
+            text="❌ Gemini",
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            text_color="#f87171"
+        )
+        self.lbl_gemini_status.pack(side="right", padx=6, pady=3)
 
-        # Кнопка ВІДТВОРИТИ ВСЕ
+        # =====================================================================
+        # 2. ПАНЕЛЬ ШВИДКОГО СТАРТУ (залишено тільки кнопку "Старт" + параметри)
+        # =====================================================================
+        controls_frame = ctk.CTkFrame(self, corner_radius=6, height=34)
+        controls_frame.pack(fill="x", padx=10, pady=2)
+
+        # Невидимі віджети-заглушки для зворотної сумісності внутрішніх викликів .configure(state=...)
+        self.btn_record = ctk.CTkButton(controls_frame, text="", width=1, height=1)
+        self.btn_append = ctk.CTkButton(controls_frame, text="", width=1, height=1)
+        self.btn_retrain = ctk.CTkButton(controls_frame, text="", width=1, height=1)
+        self.btn_play_chunk = ctk.CTkButton(controls_frame, text="", width=1, height=1)
+        self.btn_stop = ctk.CTkButton(controls_frame, text="", width=1, height=1)
+
+        start_hk = (self.hk_config.get("start_playback") or "f6").upper()
         self.btn_play = ctk.CTkButton(
             controls_frame,
-            text="▶ Запустити все",
-            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            text=f"▶ Старт ({start_hk})",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
             fg_color="#10b981",
             hover_color="#059669",
-            height=38,
-            width=135,
-            corner_radius=8,
+            height=28,
+            width=125,
+            corner_radius=6,
             command=self.start_playback
         )
-        self.btn_play.pack(side="left", padx=3, pady=8)
+        self.btn_play.pack(side="left", padx=(8, 8), pady=4)
 
-        # Кнопка ВІДТВОРИТИ З ОБРАНОГО / ШМАТОК
-        self.btn_play_chunk = ctk.CTkButton(
-            controls_frame,
-            text="▶️ З обраного",
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-            fg_color="#0284c7",
-            hover_color="#0369a1",
-            height=38,
-            width=115,
-            corner_radius=8,
-            command=self.start_playback_from_selected
-        )
-        self.btn_play_chunk.pack(side="left", padx=3, pady=8)
+        sep1 = ctk.CTkFrame(controls_frame, width=1, height=22, fg_color="#334155")
+        sep1.pack(side="left", padx=4, pady=4)
 
-        # Кнопка ЗУПИНИТИ
-        self.btn_stop = ctk.CTkButton(
-            controls_frame,
-            text="⏹ Зупинити (Esc)",
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-            fg_color="#475569",
-            hover_color="#334155",
-            height=38,
-            width=120,
-            corner_radius=8,
-            state="disabled",
-            command=self.stop_playback
-        )
-        self.btn_stop.pack(side="left", padx=3, pady=8)
-
-        sep = ctk.CTkFrame(controls_frame, width=2, height=34, fg_color="#334155")
-        sep.pack(side="left", padx=8, pady=8)
-
-        # Налаштування циклів (Повторення: наприклад 50 разів)
-        lbl_cycles = ctk.CTkLabel(
-            controls_frame,
-            text="Листів:",
-            font=ctk.CTkFont(size=12, weight="bold")
-        )
-        lbl_cycles.pack(side="left", padx=(2, 4))
+        lbl_cycles = ctk.CTkLabel(controls_frame, text="Листів:", font=ctk.CTkFont(size=11))
+        lbl_cycles.pack(side="left", padx=(4, 3))
 
         self.spin_cycles = ctk.CTkEntry(
             controls_frame,
-            width=58,
-            height=32,
-            font=ctk.CTkFont(size=13, weight="bold"),
+            width=46,
+            height=24,
+            font=ctk.CTkFont(size=11, weight="bold"),
             justify="center"
         )
         self.spin_cycles.insert(0, "50")
-        self.spin_cycles.pack(side="left", padx=(0, 10))
+        self.spin_cycles.pack(side="left", padx=(0, 8))
 
-        # Швидкість відтворення
-        lbl_speed = ctk.CTkLabel(
-            controls_frame,
-            text="Швидкість:",
-            font=ctk.CTkFont(size=12)
-        )
-        lbl_speed.pack(side="left", padx=(2, 4))
+        lbl_speed = ctk.CTkLabel(controls_frame, text="Швидкість:", font=ctk.CTkFont(size=11))
+        lbl_speed.pack(side="left", padx=(2, 3))
 
         self.combo_speed = ctk.CTkComboBox(
             controls_frame,
             values=["1.0x (Реальна)", "1.25x (Швидше)", "1.5x (Дуже швидко)", "0.8x (Спокійна)"],
-            width=140,
-            height=32,
+            width=125,
+            height=24,
+            font=ctk.CTkFont(size=11),
             state="readonly"
         )
         self.combo_speed.set("1.0x (Реальна)")
-        self.combo_speed.pack(side="left", padx=5)
+        self.combo_speed.pack(side="left", padx=2)
 
-        # Чекбокс Smart Vision
+        # Компактні чекбокси справа
         self.chk_smart_vision = ctk.CTkCheckBox(
             controls_frame,
             text="🎯 Smart Vision",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=ctk.CTkFont(size=11, weight="bold"),
             text_color="#38bdf8",
+            checkbox_width=16,
+            checkbox_height=16,
+            variable=self.var_smart_vision,
             onvalue=True,
             offvalue=False
         )
-        self.chk_smart_vision.select()
-        self.chk_smart_vision.pack(side="right", padx=8)
+        self.chk_smart_vision.pack(side="right", padx=(6, 10))
 
-        # Опція паузи на початку кожного циклу
         self.chk_pause_cycle = ctk.CTkCheckBox(
             controls_frame,
-            text="Чекати вибору листа",
-            font=ctk.CTkFont(size=12),
+            text="⏸ Пауза циклу",
+            font=ctk.CTkFont(size=11),
+            checkbox_width=16,
+            checkbox_height=16,
+            variable=self.var_pause_cycle,
             onvalue=True,
             offvalue=False
         )
-        self.chk_pause_cycle.select()
-        self.chk_pause_cycle.pack(side="right", padx=10)
+        self.chk_pause_cycle.pack(side="right", padx=6)
 
-        # 2b. Панель Gemini Vision API Key
-        gemini_frame = ctk.CTkFrame(self, corner_radius=8, fg_color=("#1e1b4b", "#0a0a1a"))
-        gemini_frame.pack(fill="x", padx=15, pady=(0, 4))
+        # =====================================================================
+        # 2b. ПРИХОВАНА ПАНЕЛЬ GEMINI API (відкривається через "⚙️ Налаштування ▾")
+        # =====================================================================
+        self.gemini_frame = ctk.CTkFrame(self, corner_radius=6, fg_color=("#1e1b4b", "#0a0a1a"))
 
         lbl_gemini = ctk.CTkLabel(
-            gemini_frame,
+            self.gemini_frame,
             text="🤖 Gemini Vision API:",
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
             text_color="#a78bfa"
         )
-        lbl_gemini.pack(side="left", padx=(12, 8), pady=6)
+        lbl_gemini.pack(side="left", padx=(10, 6), pady=4)
 
         self.entry_api_key = ctk.CTkEntry(
-            gemini_frame,
+            self.gemini_frame,
             placeholder_text="AIza... (Google AI Studio API Key)",
-            width=350,
-            height=28,
-            font=ctk.CTkFont(size=12),
+            width=300,
+            height=24,
+            font=ctk.CTkFont(size=11),
             show="*"
         )
-        self.entry_api_key.pack(side="left", padx=(0, 8), pady=6)
+        self.entry_api_key.pack(side="left", padx=(0, 6), pady=4)
 
         self.btn_save_key = ctk.CTkButton(
-            gemini_frame,
-            text="✔ Застосувати",
+            self.gemini_frame,
+            text="✔ Зберегти",
             font=ctk.CTkFont(size=11),
             fg_color="#4f46e5",
             hover_color="#4338ca",
-            height=28,
-            width=100,
+            height=24,
+            width=84,
             command=self._apply_gemini_api_key
         )
-        self.btn_save_key.pack(side="left", padx=4, pady=6)
+        self.btn_save_key.pack(side="left", padx=3, pady=4)
 
-        self.lbl_gemini_status = ctk.CTkLabel(
-            gemini_frame,
-            text="❌ Не налаштовано",
+        btn_hide_gemini = ctk.CTkButton(
+            self.gemini_frame,
+            text="✖ Сховати",
             font=ctk.CTkFont(size=11),
-            text_color="#f87171"
+            fg_color="#334155",
+            hover_color="#475569",
+            height=24,
+            width=70,
+            command=self._toggle_gemini_bar
         )
-        self.lbl_gemini_status.pack(side="left", padx=8, pady=6)
+        btn_hide_gemini.pack(side="right", padx=8, pady=4)
 
-        lbl_gemini_hint = ctk.CTkLabel(
-            gemini_frame,
-            text="ℹ️ Ключ отримайте на aistudio.google.com",
-            font=ctk.CTkFont(size=10),
-            text_color="#64748b"
-        )
-        lbl_gemini_hint.pack(side="right", padx=12)
+        # =====================================================================
+        # 3. ЦЕНТРАЛЬНА ЧАСТИНА — ІНТЕРАКТИВНА ТАБЛИЦЯ ДІЙ (з кнопками - / + та вводом часу)
+        # =====================================================================
+        self.center_frame = ctk.CTkFrame(self, corner_radius=8)
+        self.center_frame.pack(fill="both", expand=True, padx=10, pady=3)
 
-        # 3. Центральна частина — Таблиця дій сценарію
-        center_frame = ctk.CTkFrame(self, corner_radius=10)
-        center_frame.pack(fill="both", expand=True, padx=15, pady=5)
-
-        list_header = ctk.CTkFrame(center_frame, fg_color="transparent")
-        list_header.pack(fill="x", padx=15, pady=(8, 4))
+        list_header = ctk.CTkFrame(self.center_frame, fg_color="transparent")
+        list_header.pack(fill="x", padx=10, pady=(4, 2))
 
         self.lbl_actions_count = ctk.CTkLabel(
             list_header,
             text="📋 Кроки сценарію (0 дій):",
-            font=ctk.CTkFont(size=14, weight="bold")
+            font=ctk.CTkFont(size=12, weight="bold")
         )
         self.lbl_actions_count.pack(side="left")
 
-        # Кнопки для збереження / завантаження
-        btn_template = ctk.CTkButton(
+        lbl_delay_hint = ctk.CTkLabel(
             list_header,
-            text="📄 Зразок (Пошта + 2 PDF)",
+            text="⏱ Справа біля кожної дії: кнопки [−] / [+] (±0.05с) або введіть точний час вручну",
             font=ctk.CTkFont(size=11),
-            fg_color="#6366f1",
-            hover_color="#4f46e5",
-            height=28,
-            command=self._load_example_template
+            text_color="#94a3b8"
         )
-        btn_template.pack(side="right", padx=4)
+        lbl_delay_hint.pack(side="right")
 
-        btn_save = ctk.CTkButton(
-            list_header,
-            text="💾 Зберегти у файл",
-            font=ctk.CTkFont(size=11),
-            fg_color="#334155",
-            hover_color="#475569",
-            height=28,
-            command=self.save_workflow_dialog
+        # Таблиця дій з інтерактивними полями часу виконання та кнопками - / +
+        tree_container = ctk.CTkFrame(self.center_frame, fg_color="transparent")
+        tree_container.pack(fill="both", expand=True, padx=10, pady=(2, 6))
+
+        self.tree = InteractiveActionTable(
+            tree_container,
+            on_delay_changed=self._on_step_delay_changed,
+            on_key_count_changed=self._on_step_key_count_changed
         )
-        btn_save.pack(side="right", padx=4)
-
-        btn_open = ctk.CTkButton(
-            list_header,
-            text="📂 Відкрити файл",
-            font=ctk.CTkFont(size=11),
-            fg_color="#334155",
-            hover_color="#475569",
-            height=28,
-            command=self.load_workflow_dialog
-        )
-        btn_open.pack(side="right", padx=4)
-
-        # Стиль для Treeview
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure(
-            "Treeview",
-            background="#1e293b",
-            foreground="#f8fafc",
-            fieldbackground="#1e293b",
-            rowheight=30,
-            font=("Segoe UI", 11)
-        )
-        style.configure(
-            "Treeview.Heading",
-            background="#0f172a",
-            foreground="#93c5fd",
-            relief="flat",
-            font=("Segoe UI", 11, "bold")
-        )
-        style.map("Treeview", background=[("selected", "#2563eb")])
-
-        # Таблиця дій
-        tree_container = ctk.CTkFrame(center_frame, fg_color="transparent")
-        tree_container.pack(fill="both", expand=True, padx=15, pady=4)
-
-        columns = ("num", "type", "description", "vision", "delay")
-        self.tree = ttk.Treeview(tree_container, columns=columns, show="headings", selectmode="browse")
-
-        self.tree.heading("num", text="№")
-        self.tree.heading("type", text="Тип дії")
-        self.tree.heading("description", text="Деталі / Повідомлення")
-        self.tree.heading("vision", text="Vision (знімки)")
-        self.tree.heading("delay", text="Затримка")
-
-        self.tree.column("num", width=40, anchor="center")
-        self.tree.column("type", width=150, anchor="w")
-        self.tree.column("description", width=520, anchor="w")
-        self.tree.column("vision", width=120, anchor="center")
-        self.tree.column("delay", width=80, anchor="center")
-
-        self.tree.tag_configure("checkpoint", background="#451a03", foreground="#fde68a")
-        self.tree.tag_configure("click", foreground="#e2e8f0")
-        self.tree.tag_configure("area", foreground="#38bdf8")
-        self.tree.tag_configure("scroll", foreground="#a78bfa")
-        self.tree.tag_configure("file", foreground="#34d399")
-        self.tree.tag_configure("menu", foreground="#fcd34d")
-        self.tree.tag_configure("key", foreground="#cbd5e1")
-        self.tree.tag_configure("running", background="#1e3a8a", foreground="#ffffff")
-
-        scrollbar = ttk.Scrollbar(tree_container, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-
-        self.tree.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        self.tree.pack(fill="both", expand=True)
 
         self.tree.bind("<Double-1>", lambda e: self.edit_selected_action())
         self.tree.bind("<Button-3>", self._show_tree_context_menu)
+        self.tree.bind("<Delete>", lambda e: self.delete_selected_action())
 
-        # Нижня панель дій над списком
-        list_toolbar = ctk.CTkFrame(center_frame, fg_color="transparent")
-        list_toolbar.pack(fill="x", padx=15, pady=(4, 8))
+        # Гарячі клавіші вікна
+        self.bind("<Control-o>", lambda e: self.load_workflow_dialog())
+        self.bind("<Control-s>", lambda e: self.save_workflow_dialog())
 
-        btn_add_action = ctk.CTkButton(
-            list_toolbar,
-            text="➕ Додати дію",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color="#2563eb",
-            hover_color="#1d4ed8",
-            text_color="#ffffff",
-            height=30,
-            command=self.open_add_action_dialog
-        )
-        btn_add_action.pack(side="left", padx=(0, 6))
-
-        btn_start_seq = ctk.CTkButton(
-            list_toolbar,
-            text="✨ Старт (Область ➔ До низу ➔ Файл)",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color="#0d9488",
-            hover_color="#0f766e",
-            text_color="#ffffff",
-            height=30,
-            command=self.add_start_sequence_dialog
-        )
-        btn_start_seq.pack(side="left", padx=4)
-
-        btn_add_cp = ctk.CTkButton(
-            list_toolbar,
-            text="➕ Точка схвалення",
-            font=ctk.CTkFont(size=12),
-            fg_color="#f59e0b",
-            hover_color="#d97706",
-            text_color="#000000",
-            height=30,
-            command=self.add_manual_checkpoint
-        )
-        btn_add_cp.pack(side="left", padx=4)
-
-
-        btn_edit = ctk.CTkButton(
-            list_toolbar,
-            text="✏️ Редагувати крок",
-            font=ctk.CTkFont(size=12),
-            fg_color="#334155",
-            hover_color="#475569",
-            height=30,
-            command=self.edit_selected_action
-        )
-        btn_edit.pack(side="left", padx=4)
-
-        btn_del = ctk.CTkButton(
-            list_toolbar,
-            text="🗑️ Видалити",
-            font=ctk.CTkFont(size=12),
-            fg_color="#7f1d1d",
-            hover_color="#991b1b",
-            height=30,
-            command=self.delete_selected_action
-        )
-        btn_del.pack(side="left", padx=4)
-
-        btn_up = ctk.CTkButton(
-            list_toolbar,
-            text="⬆️ Вгору",
-            font=ctk.CTkFont(size=12),
-            fg_color="#334155",
-            hover_color="#475569",
-            width=70,
-            height=30,
-            command=lambda: self._move_action(-1)
-        )
-        btn_up.pack(side="left", padx=4)
-
-        btn_down = ctk.CTkButton(
-            list_toolbar,
-            text="⬇️ Вниз",
-            font=ctk.CTkFont(size=12),
-            fg_color="#334155",
-            hover_color="#475569",
-            width=70,
-            height=30,
-            command=lambda: self._move_action(1)
-        )
-        btn_down.pack(side="left", padx=4)
-
-        btn_clear = ctk.CTkButton(
-            list_toolbar,
-            text="🧹 Очистити все",
-            font=ctk.CTkFont(size=12),
-            fg_color="#334155",
-            hover_color="#475569",
-            height=30,
-            command=self.clear_actions
-        )
-        btn_clear.pack(side="right")
-
-        # 4. Нижня статусна панель та Прогрес-бар
-        status_frame = ctk.CTkFrame(self, corner_radius=10)
-        status_frame.pack(fill="x", padx=15, pady=(4, 12))
+        # =====================================================================
+        # 4. НИЖНЯ СТАТУСНА ПАНЕЛЬ ТА ПРОГРЕС-БАР
+        # =====================================================================
+        status_frame = ctk.CTkFrame(self, corner_radius=6)
+        status_frame.pack(fill="x", padx=10, pady=(2, 8))
 
         self.lbl_progress_text = ctk.CTkLabel(
             status_frame,
-            text="Очікування запуску. Оберіть кількість листів та натисніть 'Запустити автоматизацію'.",
-            font=ctk.CTkFont(size=12),
+            text="Готовий. Всі дії доступні у верхньому меню. Натисніть '▶ Старт' або гарячу клавішу для швидкого запуску.",
+            font=ctk.CTkFont(size=11),
             text_color="#94a3b8"
         )
-        self.lbl_progress_text.pack(anchor="w", padx=15, pady=(6, 2))
+        self.lbl_progress_text.pack(anchor="w", padx=10, pady=(4, 2))
 
-        self.progress_bar = ctk.CTkProgressBar(status_frame, height=10)
+        self.progress_bar = ctk.CTkProgressBar(status_frame, height=8)
         self.progress_bar.set(0.0)
-        self.progress_bar.pack(fill="x", padx=15, pady=(2, 8))
+        self.progress_bar.pack(fill="x", padx=10, pady=(0, 6))
+
+    def _rebuild_top_menus(self):
+        """Створює або оновлює всі випадаючі списки верхнього меню з актуальними підписами гарячих клавіш."""
+        hk_start = (self.hk_config.get("start_playback") or "f6").upper()
+        hk_stop = (self.hk_config.get("stop_playback") or "esc").upper()
+        hk_rec = (self.hk_config.get("start_recording") or "f7").upper()
+        hk_cp = (self.hk_config.get("checkpoint") or "f8").upper()
+        hk_tray = (self.hk_config.get("toggle_tray") or "f12").upper()
+
+        # 1) Меню "Файл"
+        self.menu_file = self._create_dropdown_menu()
+        self.menu_file.add_command(label="📂 Відкрити сценарій...                  Ctrl+O", command=self.load_workflow_dialog)
+        self.menu_file.add_command(label="💾 Зберегти сценарій...                  Ctrl+S", command=self.save_workflow_dialog)
+        self.menu_file.add_separator()
+        self.menu_file.add_command(label="📄 Завантажити зразок (Пошта + 2 PDF)", command=self._load_example_template)
+        self.menu_file.add_separator()
+        self.menu_file.add_command(label=f"📥 Згорнути у трей (біля годинника)     {hk_tray}", command=self.minimize_to_tray)
+        self.menu_file.add_separator()
+        self.menu_file.add_command(label="🚪 Вихід", command=self.quit_app)
+
+        # 2) Меню "Навчання (Запис)"
+        self.menu_record = self._create_dropdown_menu()
+        self.menu_record.add_command(label=f"⏺ Навчити з нуля (новий запис)          {hk_rec}", command=self.start_recording)
+        self.menu_record.add_command(label="⏺➕ Дозаписати дії (в кінець / після кроку)...", command=self.open_append_recording_dialog)
+        self.menu_record.add_command(label="🧠 Донавчання шматка сценарію...", command=self.open_retrain_chunk_dialog)
+
+        # 3) Меню "Виконання (Старт)"
+        self.menu_play = self._create_dropdown_menu()
+        self.menu_play.add_command(label=f"▶️ Запустити весь сценарій (Старт)       {hk_start}", command=self.start_playback)
+        self.menu_play.add_command(label="▶️ Запустити з обраного кроку", command=self.start_playback_from_selected)
+        self.menu_play.add_command(label="🔬 Протестувати тільки обраний крок", command=self.test_single_action)
+        self.menu_play.add_separator()
+        self.menu_play.add_command(label=f"⏹ Зупинити виконання                    {hk_stop}", command=self.stop_playback)
+
+        # 4) Меню "Додати дію"
+        self.menu_add = self._create_dropdown_menu()
+        self.menu_add.add_command(label="➕ Конструктор нової дії (усі параметри)...", command=self.open_add_action_dialog)
+        self.menu_add.add_separator()
+        self.menu_add.add_command(label="🖨️ Друк документу (Ctrl+P)", command=self.add_print_ctrl_p_quick)
+        self.menu_add.add_command(label="❌ Закрити активне вікно (Alt+F4)", command=self.add_close_window_alt_f4_quick)
+        self.menu_add.add_command(label="🖱️ Меню мишею (ПКМ без руху курсора)", command=self.add_mouse_menu_quick)
+        self.menu_add.add_command(label="📋 Клавіша 'Меню' (контекстне меню VK_APPS)", command=self.add_context_menu_key_action)
+        self.menu_add.add_command(label="🎹 Клавіша клавіатури (стрілки ↑↓←→, Enter, Ctrl+P, Alt+F4)...", command=self.open_quick_key_capture_dialog)
+        self.menu_add.add_separator()
+        self.menu_add.add_command(label="📜 Прокрутка до самого низу (вертикально)", command=self.add_scroll_to_bottom_quick)
+        self.menu_add.add_command(label=f"🛑 Точка схвалення / перевірки           {hk_cp}", command=self.add_manual_checkpoint)
+        self.menu_add.add_separator()
+        self.menu_add.add_command(label="✨ Стартовий набір (Область ➔ До низу ➔ Файл)", command=self.add_start_sequence_dialog)
+
+        # 5) Меню "Правка (Кроки)"
+        self.menu_edit = self._create_dropdown_menu()
+        self.menu_edit.add_command(label="✏️ Редагувати обраний крок...", command=self.edit_selected_action)
+        self.menu_edit.add_command(label="🗑️ Видалити обраний крок (Del)", command=self.delete_selected_action)
+        self.menu_edit.add_separator()
+        self.menu_edit.add_command(label="⬆️ Перемістити крок вгору", command=lambda: self._move_action(-1))
+        self.menu_edit.add_command(label="⬇️ Перемістити крок вниз", command=lambda: self._move_action(1))
+        self.menu_edit.add_separator()
+        self.menu_edit.add_command(label="🧹 Очистити весь список", command=self.clear_actions)
+
+        # 6) Меню "Налаштування"
+        self.menu_settings = self._create_dropdown_menu()
+        self.menu_settings.add_command(
+            label="⌨️ Гарячі клавіші (Налаштування всіх кнопок)...",
+            command=self.open_hotkeys_settings_dialog
+        )
+        self.menu_settings.add_command(
+            label=f"📥 Згорнути у системний трей ({hk_tray})",
+            command=self.minimize_to_tray
+        )
+        self.menu_settings.add_separator()
+        self.menu_settings.add_checkbutton(
+            label="🎯 Використовувати Smart Vision",
+            variable=self.var_smart_vision,
+            command=self._sync_checkboxes_from_vars
+        )
+        self.menu_settings.add_checkbutton(
+            label="⏸ Чекати вибору листа перед циклом",
+            variable=self.var_pause_cycle,
+            command=self._sync_checkboxes_from_vars
+        )
+        self.menu_settings.add_separator()
+        self.menu_settings.add_command(
+            label="🤖 Показати / Сховати панель ключа Gemini API",
+            command=self._toggle_gemini_bar
+        )
+
+    def _on_step_delay_changed(self, step_idx: int, new_delay: float):
+        """Оновлює час затримки (delay_before) для конкретного кроку при натисканні -/+ або ручному вводі."""
+        if 0 <= step_idx < len(self.workflow.actions):
+            act = self.workflow.actions[step_idx]
+            act.delay_before = round(max(0.0, new_delay), 2)
+            if act.type == "delay":
+                iid = str(step_idx)
+                if self.tree.exists(iid):
+                    info = self.tree.item(iid)
+                    if isinstance(info, dict) and "lbl_desc" in info:
+                        info["lbl_desc"].configure(text=f"Очікування {act.delay_before:.2f} с")
+            self._autosave_current_workflow()
+
+    def _on_step_key_count_changed(self, step_idx: int, new_count: int):
+        """Оновлює кількість натискань клавіші (key_press_count) для клавіатурного кроку прямо з таблиці."""
+        if 0 <= step_idx < len(self.workflow.actions):
+            act = self.workflow.actions[step_idx]
+            act.key_press_count = max(1, int(new_count))
+            base_desc = get_key_display_name(act.key)
+            cnt_part = f"  [×{act.key_press_count} натиск.]" if act.key_press_count > 1 else ""
+            iid = str(step_idx)
+            if self.tree.exists(iid):
+                info = self.tree.item(iid)
+                if isinstance(info, dict) and "lbl_desc" in info:
+                    info["lbl_desc"].configure(text=f"{base_desc}{cnt_part}")
+            self._autosave_current_workflow()
+
+    # =====================================================================
+    # СИСТЕМНИЙ ТРЕЙ WINDOWS ТА ГЛОБАЛЬНІ ГАРЯЧІ КЛАВІШІ
+    # =====================================================================
+    def _init_tray_and_global_hotkeys(self):
+        hk_start = (self.hk_config.get("start_playback") or "f6").upper()
+        hk_stop = (self.hk_config.get("stop_playback") or "esc").upper()
+        self.tray_manager.start(tooltip=f"AutoFlow Assistant (Старт: {hk_start} | Стоп: {hk_stop})")
+        self._start_global_hotkey_listener()
+
+    def _start_global_hotkey_listener(self):
+        """Глобальний перехоплювач гарячих клавіш (працює навіть коли вікно згорнуто в трей)."""
+        if self._global_kb_listener is not None:
+            try:
+                self._global_kb_listener.stop()
+            except Exception:
+                pass
+
+        def on_press(key):
+            # Під час активного запису клавіші обробляє сам recorder
+            if self.recorder.is_recording:
+                return
+            try:
+                norm = normalize_pynput_key(key)
+                if not norm:
+                    return
+                hk_start = self.hk_config.get("start_playback") or "f6"
+                hk_stop = self.hk_config.get("stop_playback") or "esc"
+                hk_rec = self.hk_config.get("start_recording") or "f7"
+                hk_tray = self.hk_config.get("toggle_tray") or "f12"
+
+                if norm == hk_start and not self.player.is_running:
+                    self.after(0, self.start_playback)
+                elif norm == hk_stop and self.player.is_running:
+                    self.after(0, self.stop_playback)
+                elif norm == hk_rec and not self.player.is_running:
+                    self.after(0, self.start_recording)
+                elif norm == hk_tray:
+                    self.after(0, self.toggle_tray_state)
+            except Exception:
+                pass
+
+        self._global_kb_listener = pynput_keyboard.Listener(on_press=on_press)
+        self._global_kb_listener.daemon = True
+        self._global_kb_listener.start()
+
+    def open_hotkeys_settings_dialog(self):
+        """Відкриває вікно налаштування всіх гарячих клавіш."""
+        def on_saved():
+            self._rebuild_top_menus()
+            hk_start = (self.hk_config.get("start_playback") or "f6").upper()
+            hk_stop = (self.hk_config.get("stop_playback") or "esc").upper()
+            self.btn_play.configure(text=f"▶ Старт ({hk_start})")
+            self.tray_manager.update_tooltip(f"AutoFlow Assistant (Старт: {hk_start} | Стоп: {hk_stop})")
+
+        HotkeysSettingsDialog(self, on_saved=on_saved)
+
+    def _open_hotkeys_from_tray(self):
+        self.restore_from_tray()
+        self.after(100, self.open_hotkeys_settings_dialog)
+
+    def minimize_to_tray(self):
+        """Згортає програму в системний трей Windows (біля годинника)."""
+        self._is_in_tray = True
+        self.withdraw()
+        hk_start = (self.hk_config.get("start_playback") or "f6").upper()
+        self.tray_manager.show_balloon(
+            "AutoFlow у фоновому режимі",
+            f"Програму згорнуто в трей. Натисніть [{hk_start}] для швидкого Старту сценарію або клікніть по іконці."
+        )
+
+    def restore_from_tray(self):
+        """Відновлює головне вікно з системного трею."""
+        self._is_in_tray = False
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def toggle_tray_state(self):
+        if self._is_in_tray:
+            self.restore_from_tray()
+        else:
+            self.minimize_to_tray()
+
+    def quit_app(self):
+        """Коректно зупиняє всі слухачі, зберігає останній сценарій, видаляє іконку з трею та закриває застосунок."""
+        try:
+            self._autosave_current_workflow()
+        except Exception:
+            pass
+        try:
+            if self.player.is_running:
+                self.player.abort()
+        except Exception:
+            pass
+        try:
+            if self._global_kb_listener:
+                self._global_kb_listener.stop()
+        except Exception:
+            pass
+        try:
+            self.tray_manager.stop()
+        except Exception:
+            pass
+        self.destroy()
+
+    def _sync_checkboxes_from_vars(self):
+        """Синхронізує стан чекбоксів із опціями верхнього меню."""
+        if self.var_smart_vision.get():
+            self.chk_smart_vision.select()
+        else:
+            self.chk_smart_vision.deselect()
+
+        if self.var_pause_cycle.get():
+            self.chk_pause_cycle.select()
+        else:
+            self.chk_pause_cycle.deselect()
+
+    def _toggle_gemini_bar(self):
+        """Показує або ховає панель налаштування ключа Gemini Vision API."""
+        if self._gemini_bar_visible:
+            self.gemini_frame.pack_forget()
+            self._gemini_bar_visible = False
+        else:
+            self.gemini_frame.pack(fill="x", padx=10, pady=2, before=self.center_frame)
+            self._gemini_bar_visible = True
 
     def _refresh_table(self):
         """Оновлює відображення дій у таблиці."""
@@ -605,6 +1104,15 @@ class AutoFlowApp(ctk.CTk):
                 desc = f"Друк \"{fname}\" ➔ [{action.printer_name or 'типовий принтер'}]"
                 vision_badge = "Системний"
                 tag = "file"
+            elif getattr(action, "click_at_cursor", False) or action.type == "right_click" or (
+                action.type == "menu_click" and action.button == "right"
+            ):
+                type_str = "🖱️ Меню (ПКМ на місці)"
+                desc = "Правий клік миші у поточній точці курсора (без руху)"
+                if action.comment and action.comment not in ("Пункт меню: 'пункт меню'", "Виклик меню (правий клік без руху курсора)"):
+                    desc += f"  [{action.comment}]"
+                vision_badge = "На місці курсора"
+                tag = "menu"
             elif action.type == "menu_click" or getattr(action, "target_type", "") == "menu_item":
                 type_str = "📋 Пункт меню"
                 name_str = f" \"{action.element_text or action.uia_name}\"" if (action.element_text or action.uia_name) else ""
@@ -639,9 +1147,26 @@ class AutoFlowApp(ctk.CTk):
                     vision_badge = "Тільки координати"
                 tag = "click"
             elif "key" in action.type:
-                type_str = "⌨️ Клавіша"
-                desc = f"Натискання: '{action.key}'"
-                tag = "key"
+                k_low = (action.key or "").lower()
+                k_cnt = max(1, int(getattr(action, "key_press_count", 1) or 1))
+                if k_low == "ctrl+p":
+                    type_str = "🖨️ Друк (Ctrl+P)"
+                    tag = "file"
+                elif k_low == "alt+f4":
+                    type_str = "❌ Закрити (Alt+F4)"
+                    tag = "checkpoint"
+                elif k_low in ("menu", "apps", "context_menu", "shift+f10"):
+                    type_str = "📋 Клавіша 'Меню'"
+                    tag = "menu"
+                else:
+                    type_str = "⌨️ Клавіша"
+                    tag = "key"
+                desc = get_key_display_name(action.key)
+                if k_cnt > 1:
+                    desc += f"  [×{k_cnt} натиск.]"
+                if action.comment and not action.comment.startswith(get_key_display_name(action.key)):
+                    desc += f"  [{action.comment}]"
+                vision_badge = f"KEY_COUNT:{k_cnt}"
             elif action.type == "delay":
                 type_str = "⏳ Пауза"
                 desc = f"Очікування {delay_str}"
@@ -663,6 +1188,8 @@ class AutoFlowApp(ctk.CTk):
         self.lbl_actions_count.configure(
             text=f"📋 Кроки: {total} ({checkpoints_count} точок схвалення, {vision_count} Vision){bank_str}{gemini_str}"
         )
+        if not self._loading_workflow:
+            self._autosave_current_workflow()
 
     # ==========================================================
     # GEMINI API KEY
@@ -704,12 +1231,12 @@ class AutoFlowApp(ctk.CTk):
         """Оновлює індикатор статусу Gemini Vision."""
         if is_gemini_available():
             self.lbl_gemini_status.configure(
-                text="✅ Gemini Vision активний",
+                text="✅ Gemini",
                 text_color="#4ade80"
             )
         else:
             self.lbl_gemini_status.configure(
-                text="❌ Не налаштовано",
+                text="❌ Gemini",
                 text_color="#f87171"
             )
         self._refresh_table()
@@ -971,8 +1498,16 @@ class AutoFlowApp(ctk.CTk):
         )
 
     def _on_recorder_checkpoint(self, action: WorkflowAction):
-        if self.floating_bar:
-            self.floating_bar.show_feedback("✅ Додано точку!")
+        def update():
+            if self.floating_bar:
+                self.floating_bar.show_feedback("✅ Додано точку!")
+        self.after(0, update)
+
+    def _on_recorder_target_type_changed(self, target_type: str):
+        def update():
+            if self.floating_bar:
+                self.floating_bar._set_mode(target_type, notify=False)
+        self.after(0, update)
 
     def _on_recorder_pause_toggled(self, is_paused: bool):
         def update():
@@ -1005,7 +1540,10 @@ class AutoFlowApp(ctk.CTk):
         self.after(0, update)
 
     def _stop_recording_from_hotkey(self):
-        self.after(0, self.stop_recording)
+        if getattr(self.recorder, "_existing_workflow", None) is not None:
+            self.after(0, self._stop_training_run)
+        else:
+            self.after(0, self.stop_recording)
 
     def stop_recording(self):
         if not self.recorder.is_recording:
@@ -1368,6 +1906,112 @@ class AutoFlowApp(ctk.CTk):
             return
         AddActionDialog(self, on_save=self._on_action_added)
 
+    def add_mouse_menu_quick(self):
+        """Додає дію виклику меню мишею (правий клік без руху курсора)."""
+        if self.player.is_running:
+            messagebox.showwarning("Виконання активне", "Не можна змінювати сценарій під час його відтворення.", parent=self)
+            return
+        act = WorkflowAction(
+            type="menu_click",
+            target_type="menu_item",
+            button="right",
+            click_at_cursor=True,
+            use_vision=False,
+            delay_before=0.3,
+            comment="Виклик меню (правий клік без руху курсора)"
+        )
+        self._on_action_added(act)
+
+    def add_scroll_to_bottom_quick(self):
+        """Додає дію вертикальної прокрутки списку до самого низу."""
+        if self.player.is_running:
+            messagebox.showwarning("Виконання активне", "Не можна змінювати сценарій під час його відтворення.", parent=self)
+            return
+        act = WorkflowAction(
+            type="scroll_to_bottom",
+            scroll_to_bottom=True,
+            use_vision=False,
+            delay_before=0.5,
+            comment="Прокрутка списку до самого низу (лише по вертикалі)"
+        )
+        self._on_action_added(act)
+
+    def add_context_menu_key_action(self):
+        """Додає дію натискання клавіатурної кнопки 'Контекстне меню' (VK_APPS / Menu)."""
+        if self.player.is_running:
+            messagebox.showwarning("Виконання активне", "Не можна змінювати сценарій під час його відтворення.", parent=self)
+            return
+        act = WorkflowAction(
+            type="key_press",
+            target_type="menu_item",
+            key="menu",
+            delay_before=0.25,
+            use_vision=False,
+            comment="Виклик контекстного меню з клавіатури (Menu)"
+        )
+        self._on_action_added(act)
+
+    def add_print_ctrl_p_quick(self):
+        """Додає окремий пункт дії 'Друк документу (Ctrl+P)', що гарантовано працює на будь-якій розкладці."""
+        if self.player.is_running:
+            messagebox.showwarning("Виконання активне", "Не можна змінювати сценарій під час його відтворення.", parent=self)
+            return
+        act = WorkflowAction(
+            type="key_press",
+            target_type="element",
+            key="ctrl+p",
+            key_press_count=1,
+            delay_before=0.35,
+            use_vision=False,
+            comment="Виклик вікна друку (Ctrl+P)"
+        )
+        self._on_action_added(act)
+
+    def add_close_window_alt_f4_quick(self):
+        """Додає дію закриття активного вікна системною комбінацією Alt+F4."""
+        if self.player.is_running:
+            messagebox.showwarning("Виконання активне", "Не можна змінювати сценарій під час його відтворення.", parent=self)
+            return
+        act = WorkflowAction(
+            type="key_press",
+            target_type="element",
+            key="alt+f4",
+            key_press_count=1,
+            delay_before=0.35,
+            use_vision=False,
+            comment="Закрити активне вікно (Alt+F4)"
+        )
+        self._on_action_added(act)
+
+    def open_quick_key_capture_dialog(self):
+        """Відкриває інтерактивне вікно, де користувач натискає потрібну клавішу та вказує кількість натискань."""
+        if self.player.is_running:
+            messagebox.showwarning("Виконання активне", "Не можна змінювати сценарій під час його відтворення.", parent=self)
+            return
+
+        def on_captured_with_count(key_code: str, press_count: int):
+            cnt = max(1, int(press_count or 1))
+            base_name = get_key_display_name(key_code)
+            cnt_suffix = f" (×{cnt})" if cnt > 1 else ""
+            act = WorkflowAction(
+                type="key_press",
+                target_type="menu_item" if key_code in ("menu", "apps", "shift+f10") else "element",
+                key=key_code,
+                key_press_count=cnt,
+                delay_before=0.2,
+                use_vision=False,
+                comment=f"{base_name}{cnt_suffix}"
+            )
+            self._on_action_added(act)
+
+        KeyCaptureDialog(
+            self,
+            initial_key="down",
+            initial_count=1,
+            show_count=True,
+            on_captured_with_count=on_captured_with_count
+        )
+
     def _on_action_added(self, new_action: WorkflowAction):
         if self.player.is_running:
             return
@@ -1513,23 +2157,72 @@ class AutoFlowApp(ctk.CTk):
             self._refresh_table()
 
     # ==========================================================
-    # ФАЙЛОВІ ОПЕРАЦІЇ ТА ШАБЛОНИ
+    # ФАЙЛОВІ ОПЕРАЦІЇ ТА АВТОЗБЕРЕЖЕННЯ ОСТАННЬОГО СЦЕНАРІЮ
     # ==========================================================
+    def _save_last_workflow_state(self, file_path: Optional[str] = None):
+        """Зберігає шлях до останнього використаного сценарію у app_state.json."""
+        if file_path:
+            self._current_workflow_path = os.path.abspath(file_path)
+        state = {}
+        if os.path.exists(APP_STATE_FILE):
+            try:
+                with open(APP_STATE_FILE, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        state = loaded
+            except Exception:
+                pass
+        if self._current_workflow_path:
+            state["last_workflow_path"] = self._current_workflow_path
+        try:
+            with open(APP_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _autosave_current_workflow(self):
+        """
+        Автоматично зберігає поточний робочий сценарій у last_session_workflow.json
+        (та у відкритий користувацький файл сценарію, якщо це не вбудований шаблон),
+        щоб при наступному запуску застосунку відкривався саме останній використаний сценарій.
+        """
+        if self._loading_workflow:
+            return
+        try:
+            self.workflow.save_to_file(LAST_SESSION_WORKFLOW_FILE)
+            template_abs = os.path.abspath(os.path.join(os.path.dirname(__file__), "mail_template.json"))
+            if self._current_workflow_path and os.path.abspath(self._current_workflow_path) != template_abs:
+                try:
+                    self.workflow.save_to_file(self._current_workflow_path)
+                    self._save_last_workflow_state(self._current_workflow_path)
+                except Exception:
+                    self._save_last_workflow_state(LAST_SESSION_WORKFLOW_FILE)
+            else:
+                self._save_last_workflow_state(LAST_SESSION_WORKFLOW_FILE)
+        except Exception:
+            pass
+
     def save_workflow_dialog(self):
         if not self.workflow.actions:
             messagebox.showwarning("Порожньо", "Немає дій для збереження!", parent=self)
             return
 
+        initial_name = os.path.basename(self._current_workflow_path) if self._current_workflow_path else "mail_workflow.json"
         file_path = filedialog.asksaveasfilename(
             defaultextension=".json",
             filetypes=[("Файли сценаріїв (*.json)", "*.json"), ("Усі файли", "*.*")],
             title="Зберегти сценарій",
-            initialfile="mail_workflow.json",
+            initialfile=initial_name,
             parent=self
         )
         if file_path:
             try:
                 self.workflow.save_to_file(file_path)
+                self._save_last_workflow_state(file_path)
+                try:
+                    self.workflow.save_to_file(LAST_SESSION_WORKFLOW_FILE)
+                except Exception:
+                    pass
                 messagebox.showinfo("Збережено", f"Сценарій успішно збережено у:\n{file_path}", parent=self)
             except Exception as e:
                 messagebox.showerror("Помилка збереження", str(e), parent=self)
@@ -1542,36 +2235,85 @@ class AutoFlowApp(ctk.CTk):
         )
         if file_path:
             try:
+                self._loading_workflow = True
                 self.workflow = Workflow.load_from_file(file_path)
+                self._current_workflow_path = os.path.abspath(file_path)
                 self._refresh_table()
-                messagebox.showinfo("Завантажено", f"Сценарій успішно завантажено!\nКроків: {len(self.workflow.actions)}", parent=self)
             except Exception as e:
                 messagebox.showerror("Помилка завантаження", str(e), parent=self)
+                return
+            finally:
+                self._loading_workflow = False
+            self._save_last_workflow_state(file_path)
+            try:
+                self.workflow.save_to_file(LAST_SESSION_WORKFLOW_FILE)
+            except Exception:
+                pass
+            messagebox.showinfo("Завантажено", f"Сценарій успішно завантажено!\nКроків: {len(self.workflow.actions)}", parent=self)
 
     def _load_example_template(self):
         template_path = os.path.join(os.path.dirname(__file__), "mail_template.json")
         if os.path.exists(template_path):
             try:
+                self._loading_workflow = True
                 self.workflow = Workflow.load_from_file(template_path)
+                self._current_workflow_path = None
                 self._refresh_table()
-                messagebox.showinfo(
-                    "Зразок завантажено",
-                    "Завантажено зразок сценарію: 'Обробка пошти та друк двох PDF' з точками перевірки адреси та аркушів у принтері!\n\nВи можете записати власні кроки зі знімками кнопок та контекстних меню для вашої програми.",
-                    parent=self
-                )
             except Exception as e:
                 messagebox.showerror("Помилка", str(e), parent=self)
+                return
+            finally:
+                self._loading_workflow = False
+            self._autosave_current_workflow()
+            messagebox.showinfo(
+                "Зразок завантажено",
+                "Завантажено зразок сценарію: 'Обробка пошти та друк двох PDF' з точками перевірки адреси та аркушів у принтері!\n\nВи можете записати власні кроки зі знімками кнопок та контекстних меню для вашої програми.",
+                parent=self
+            )
         else:
             messagebox.showwarning("Не знайдено", "Файл mail_template.json не знайдено.", parent=self)
 
     def _load_default_template_if_exists(self):
-        template_path = os.path.join(os.path.dirname(__file__), "mail_template.json")
-        if os.path.exists(template_path):
+        """
+        При запуску застосунку автоматично відкриває останній використаний сценарій
+        (із app_state.json або last_session_workflow.json). Якщо користувацьких сценаріїв ще немає —
+        відкриває стартовий шаблон mail_template.json.
+        """
+        candidates = []
+
+        if os.path.exists(APP_STATE_FILE):
             try:
-                self.workflow = Workflow.load_from_file(template_path)
-                self._refresh_table()
+                with open(APP_STATE_FILE, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+                last_path = state.get("last_workflow_path") if isinstance(state, dict) else None
+                if last_path and os.path.exists(last_path):
+                    candidates.append(last_path)
             except Exception:
                 pass
+
+        if os.path.exists(LAST_SESSION_WORKFLOW_FILE) and LAST_SESSION_WORKFLOW_FILE not in candidates:
+            candidates.append(LAST_SESSION_WORKFLOW_FILE)
+
+        mail_wf_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mail_workflow.json")
+        if os.path.exists(mail_wf_path) and mail_wf_path not in candidates:
+            candidates.append(mail_wf_path)
+
+        template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mail_template.json")
+        if os.path.exists(template_path) and template_path not in candidates:
+            candidates.append(template_path)
+
+        for path_to_load in candidates:
+            try:
+                self._loading_workflow = True
+                self.workflow = Workflow.load_from_file(path_to_load)
+                if os.path.abspath(path_to_load) != os.path.abspath(template_path):
+                    self._current_workflow_path = os.path.abspath(path_to_load)
+                self._refresh_table()
+                break
+            except Exception:
+                continue
+            finally:
+                self._loading_workflow = False
 
 
 if __name__ == "__main__":

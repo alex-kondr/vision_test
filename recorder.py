@@ -46,6 +46,8 @@ class ActionRecorder:
         self.on_target_type_changed: Optional[Callable[[str], None]] = None
         
         self._press_state = {}
+        self._held_modifiers = set()
+        self._modifier_used_in_combo = False
         
         # Існуючий сценарій для об'єднання банку шаблонів (при повторному навчанні)
         self._existing_workflow: Optional[Any] = None
@@ -305,7 +307,7 @@ class ActionRecorder:
             is_menu_click = (target_type == "menu_item" or is_right_click)
 
             crop_data = None
-            if not is_area_click:
+            if not is_area_click and not is_right_click:
                 crop_data = self._capture_vision_template(x, y, is_menu=is_menu_click)
 
             extracted_text = uia_name
@@ -319,8 +321,12 @@ class ActionRecorder:
                 action_type = "area_click"
                 comment_text = "Клік по області (фокус списку)"
                 self.set_target_type("element")
+            elif is_right_click:
+                action_type = "menu_click"
+                target_type = "menu_item"
+                comment_text = "Виклик меню (правий клік без руху курсора)"
             elif is_menu_click:
-                action_type = "menu_click" if target_type == "menu_item" else ("right_click" if is_right_click else "click")
+                action_type = "menu_click"
                 item_label = extracted_text or uia_name or "пункт меню"
                 comment_text = f"Пункт меню: '{item_label}'"
             else:
@@ -337,22 +343,23 @@ class ActionRecorder:
                     action = WorkflowAction(
                         type=action_type,
                         target_type=target_type,
-                        element_text=extracted_text,
+                        element_text=extracted_text if not is_right_click else "",
                         uia_window=uia_window,
                         uia_control_type=uia_control_type,
-                        uia_name=uia_name,
+                        uia_name=uia_name if not is_right_click else "",
                         uia_automation_id=uia_auto_id,
                         uia_class_name=uia_cls,
                         delay_before=delay,
                         x=x,
                         y=y,
                         button=btn_str,
+                        click_at_cursor=is_right_click,
                         template_b64=crop_data.get("template_b64") if crop_data else None,
                         template_offset_x=crop_data.get("offset_x") if crop_data else None,
                         template_offset_y=crop_data.get("offset_y") if crop_data else None,
                         template_width=crop_data.get("width") if crop_data else None,
                         template_height=crop_data.get("height") if crop_data else None,
-                        use_vision=bool(crop_data),
+                        use_vision=bool(crop_data) and not is_right_click,
                         comment=comment_text
                     )
                     self.actions.append(action)
@@ -365,22 +372,23 @@ class ActionRecorder:
             action = WorkflowAction(
                 type=action_type,
                 target_type=target_type,
-                element_text=extracted_text,
+                element_text=extracted_text if not is_right_click else "",
                 uia_window=uia_window,
                 uia_control_type=uia_control_type,
-                uia_name=uia_name,
+                uia_name=uia_name if not is_right_click else "",
                 uia_automation_id=uia_auto_id,
                 uia_class_name=uia_cls,
                 delay_before=delay,
                 x=x,
                 y=y,
                 button=btn_str,
+                click_at_cursor=is_right_click,
                 template_b64=crop_data.get("template_b64") if crop_data else None,
                 template_offset_x=crop_data.get("offset_x") if crop_data else None,
                 template_offset_y=crop_data.get("offset_y") if crop_data else None,
                 template_width=crop_data.get("width") if crop_data else None,
                 template_height=crop_data.get("height") if crop_data else None,
-                use_vision=bool(crop_data),
+                use_vision=bool(crop_data) and not is_right_click,
                 comment=comment_text
             )
             self.actions.append(action)
@@ -389,28 +397,50 @@ class ActionRecorder:
 
 
     def _normalize_key(self, key) -> Tuple[str, bool]:
-        if isinstance(key, keyboard.Key):
-            return key.name, True
-        elif isinstance(key, keyboard.KeyCode):
-            if key.char:
-                return key.char, False
-            elif key.vk:
-                return f"vk_{key.vk}", True
-        return str(key), False
+        try:
+            from tray_and_hotkeys import normalize_pynput_key
+            norm = normalize_pynput_key(key)
+            return norm, isinstance(key, keyboard.Key)
+        except Exception:
+            if isinstance(key, keyboard.Key):
+                return key.name, True
+            elif isinstance(key, keyboard.KeyCode):
+                if key.char:
+                    return key.char, False
+                elif key.vk:
+                    return f"vk_{key.vk}", True
+            return str(key), False
+
+    def _get_recording_hotkeys(self) -> Tuple[str, str, str]:
+        try:
+            from tray_and_hotkeys import HotkeysConfig
+            hk = HotkeysConfig.instance()
+            return (
+                hk.get("checkpoint") or "f8",
+                hk.get("pause_recording") or "f9",
+                hk.get("stop_recording") or "f10",
+            )
+        except Exception:
+            return ("f8", "f9", "f10")
 
     def _on_key_press(self, key):
         if not self.is_recording:
             return
 
         key_name, is_special = self._normalize_key(key)
+        hk_cp, hk_pause, hk_stop = self._get_recording_hotkeys()
 
-        # Гаряча клавіша F9: Пауза / Відновлення запису (працює завжди!)
-        if key_name == "f9":
+        if key_name in ("ctrl", "shift", "alt"):
+            self._held_modifiers.add(key_name)
+            return
+
+        # Гаряча клавіша Пауза / Відновлення запису (працює завжди!)
+        if key_name == hk_pause:
             self.toggle_pause()
             return
 
-        # Гаряча клавіша F10: Завершити запис
-        if key_name == "f10":
+        # Гаряча клавіша Завершити запис
+        if key_name == hk_stop:
             if self.on_stop_requested:
                 self.on_stop_requested()
             return
@@ -419,8 +449,8 @@ class ActionRecorder:
         if self.is_paused:
             return
 
-        # Гаряча клавіша F8: Додати точку схвалення
-        if key_name == "f8":
+        # Гаряча клавіша Додати точку схвалення
+        if key_name == hk_cp:
             self.add_checkpoint(
                 title="Точка перевірки", 
                 message="Будь ласка, перевірте стан на екрані та натисніть 'Продовжити'"
@@ -432,19 +462,45 @@ class ActionRecorder:
             return
             
         key_name, is_special = self._normalize_key(key)
-        
-        # Ігноруємо службові клавіші керування
-        if key_name in ("f8", "f9", "f10"):
+        if key_name in ("ctrl", "shift", "alt"):
+            self._held_modifiers.discard(key_name)
             return
 
+        hk_cp, hk_pause, hk_stop = self._get_recording_hotkeys()
+        try:
+            from tray_and_hotkeys import HotkeysConfig
+            hk_rec_start = HotkeysConfig.instance().get("start_recording")
+        except Exception:
+            hk_rec_start = "f7"
+        
+        # Ігноруємо службові клавіші керування
+        if key_name in (hk_cp, hk_pause, hk_stop, hk_rec_start):
+            return
+
+        # Якщо утримуються модифікатори (напр. Ctrl+P, Shift+F10, Alt+F4), формуємо комбінацію
+        if self._held_modifiers:
+            ordered_mods = [m for m in ("ctrl", "alt", "shift") if m in self._held_modifiers]
+            key_name = "+".join(ordered_mods + [key_name])
+
         now = time.time()
-        delay = round(max(0.05, now - self.last_action_time), 2)
+        elapsed = now - self.last_action_time if self.last_action_time else 0.2
+        delay = round(max(0.05, elapsed), 2)
         self.last_action_time = now
+
+        # Якщо попередня дія — натискання тієї ж самої клавіші поспіль (напр. стрілка вниз кілька разів),
+        # об'єднуємо їх в одну дію зі збільшенням лічильника key_press_count
+        if self.actions and self.actions[-1].type == "key_press" and self.actions[-1].key == key_name and elapsed < 2.5:
+            prev_act = self.actions[-1]
+            prev_act.key_press_count = max(1, int(getattr(prev_act, "key_press_count", 1) or 1)) + 1
+            if self.on_action_recorded:
+                self.on_action_recorded(prev_act)
+            return
 
         action = WorkflowAction(
             type="key_press",
             delay_before=delay,
-            key=key_name
+            key=key_name,
+            key_press_count=1
         )
         self.actions.append(action)
         if self.on_action_recorded:
